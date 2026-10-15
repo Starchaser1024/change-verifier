@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>改动验收器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>改动验收器 <span class="version">MVP</span></h1>
+    <p class="subtitle">根据事先确认的规则，在「修改前 / 修改后」两个环境运行相同检查，输出需求是否实现、旧功能是否退步的证据报告。</p>
+  </div>
+  <div id="llm-status" class="llm-chip">模型状态加载中…</div>
+</header>
+
+<div id="toast" class="toast hidden"></div>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="side-actions">
+      <button class="btn primary" onclick="toggleNewTask()">＋ 新建任务</button>
+      <button class="btn" onclick="createDemoTask(false)">创建演示任务</button>
+      <button class="btn" onclick="createDemoTask(true)">演示：不可达环境</button>
+    </div>
+    <div class="hint-box">
+      演示任务需要先启动示例服务：<br>
+      <code>python demo/run_baseline.py</code>（8620）<br>
+      <code>python demo/run_candidate.py</code>（8621）
+    </div>
+    <div id="task-list" class="task-list"></div>
+  </aside>
+
+  <section class="content">
+    <div id="new-task-panel" class="panel hidden">
+      <h2>新建验收任务</h2>
+      <div class="form-grid">
+        <label>任务名称<input id="nt-name" placeholder="例：订单服务改动验收"></label>
+        <label>修改前地址（baseline）<input id="nt-baseline" value="http://127.0.0.1:8101" placeholder="http://127.0.0.1:8101"></label>
+        <label>修改后地址（candidate）<input id="nt-candidate" value="http://127.0.0.1:8102" placeholder="http://127.0.0.1:8102"></label>
+      </div>
+      <label>需求描述<textarea id="nt-requirement" rows="4" placeholder="粘贴本次修改的需求；规则将基于它编写"></textarea></label>
+      <div class="form-actions">
+        <button class="btn primary" onclick="submitNewTask()">创建</button>
+        <button class="btn" onclick="toggleNewTask()">取消</button>
+      </div>
+    </div>
+
+    <div id="empty-state" class="panel">
+      <h2>开始验收</h2>
+      <ol class="steps-guide">
+        <li>创建验收任务，填写需求、修改前 / 修改后两个 API 地址。</li>
+        <li>导入 OpenAPI 文件，或手动定义接口。</li>
+        <li>生成 / 填写验收规则，编辑并<strong>确认</strong>（规则按版本保存，运行不会修改规则）。</li>
+        <li>在两个环境运行同样的检查。</li>
+        <li>查看逐项结果、前后差异与失败原因，导出 Markdown / JSON 报告。</li>
+      </ol>
+      <p class="muted">想快速看效果？点击左侧「创建演示任务」，再启动两个示例服务即可。</p>
+    </div>
+
+    <div id="task-view" class="hidden">
+      <div class="task-head">
+        <h2 id="tv-name"></h2>
+        <div id="tv-meta" class="muted"></div>
+      </div>
+      <nav class="tabs">
+        <button class="tab" data-tab="requirement" onclick="switchTab('requirement')">需求与配置</button>
+        <button class="tab" data-tab="endpoints" onclick="switchTab('endpoints')">接口清单</button>
+        <button class="tab" data-tab="rules" onclick="switchTab('rules')">验收规则</button>
+        <button class="tab" data-tab="runs" onclick="switchTab('runs')">运行与报告</button>
+      </nav>
+
+      <div id="tab-requirement" class="tab-panel"></div>
+      <div id="tab-endpoints" class="tab-panel hidden"></div>
+      <div id="tab-rules" class="tab-panel hidden"></div>
+      <div id="tab-runs" class="tab-panel hidden"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
