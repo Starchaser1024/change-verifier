@@ -26,6 +26,23 @@ def test_unexecuted_checks_are_unverifiable():
     assert CLASSIFICATION_LABELS["unverifiable"] == "无法判断"
 
 
+def test_summary_executed_checks_excludes_unexecuted():
+    """取消运行后，摘要里的「已执行」只计真正执行过的检查（未执行的算「无法判断」）。"""
+    from verifier.classification import build_summary
+
+    comparisons = _build_comparisons(CHECKS, [(CHECKS[0], passed("baseline"), passed("candidate"))], executed_count=1)
+    summary = build_summary(
+        comparisons, total_checks=3, run_status="cancelled", cancelled=True, executed_checks=1
+    )
+    assert summary["total_checks"] == 3
+    assert summary["executed_checks"] == 1, "未执行的检查不能计入「已执行」"
+    assert summary["counts"]["unverifiable"] == 2
+    assert any("取消" in n for n in summary["notes"])
+    # 不传 executed_checks 时保持兼容：回退为 len(comparisons)
+    fallback = build_summary(comparisons, total_checks=3, run_status="cancelled", cancelled=True)
+    assert fallback["executed_checks"] == len(comparisons)
+
+
 def test_expected_change_ref_to_unexecuted_is_not_confirmed():
     """引用的新需求检查没执行（无法判断）时，旧行为失败仍算回归，不能自动洗白。"""
     checks = [

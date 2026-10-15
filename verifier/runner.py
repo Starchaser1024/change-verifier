@@ -64,7 +64,9 @@ def execute_run(run_id: int) -> None:
             comparisons = _build_comparisons(
                 checks, env_results, executed_count=len(env_results), unexecuted_reason=RUNNING_REASON
             )
-            summary = build_summary(comparisons, total_checks=len(checks), run_status=status)
+            summary = build_summary(
+                comparisons, total_checks=len(checks), run_status=status, executed_checks=len(env_results)
+            )
             payload = {
                 "run_nonce": run_nonce,
                 "partial": status == "running",
@@ -93,7 +95,13 @@ def execute_run(run_id: int) -> None:
             executed_count=len(env_results),
             unexecuted_reason=CANCELLED_REASON if cancelled else UNEXECUTED_REASON,
         )
-        summary = build_summary(comparisons, total_checks=len(checks), run_status=final_status, cancelled=cancelled)
+        summary = build_summary(
+            comparisons,
+            total_checks=len(checks),
+            run_status=final_status,
+            cancelled=cancelled,
+            executed_checks=len(env_results),
+        )
         payload = {
             "run_nonce": run_nonce,
             "partial": False,

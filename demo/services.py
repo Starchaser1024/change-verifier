@@ -10,6 +10,11 @@
   D. 订单列表缺少登录校验（未登录也能读取）
   E. 忽略 page_size 分页参数（新需求未实现）
 
+缺陷开关（用于变异评估 scripts/mutation_eval.py）：
+- candidate 默认开启全部 5 个缺陷，行为与演示一致；
+- 环境变量 DEMO_DEFECTS 可指定缺陷子集，例如 DEMO_DEFECTS=A,C 或 DEMO_DEFECTS=none；
+- baseline 永远没有缺陷。
+
 两个服务使用完全一致的初始种子数据，并都提供 POST /api/debug/reset 用于恢复初始数据。
 原有问题（两个版本都存在的 bug）：读取不存在的订单会触发 500。
 """
@@ -48,6 +53,33 @@ DEFECTS_CANDIDATE = [
     {"id": "E", "title": "忽略 page_size 分页参数", "detail": "新需求「订单列表支持 page_size」未实现"},
 ]
 
+DEFAULT_CANDIDATE_DEFECTS = tuple(d["id"] for d in DEFECTS_CANDIDATE)
+
+
+def parse_defects(value: Optional[str]) -> Optional[set[str]]:
+    """解析 DEMO_DEFECTS 环境变量。
+
+    - None 或空字符串 -> None（用默认值：candidate 全开、baseline 无缺陷）
+    - "none" -> 空集合（修好了全部演示缺陷）
+    - "A,C" / "a, c" -> {"A", "C"}
+    - 其它编号抛 ValueError，避免拼错时静默跑成「无缺陷」。
+    """
+    if value is None or not value.strip():
+        return None
+    if value.strip().lower() == "none":
+        return set()
+    ids: set[str] = set()
+    for part in value.replace("，", ",").split(","):
+        part = part.strip().upper()
+        if not part:
+            continue
+        if part not in DEFAULT_CANDIDATE_DEFECTS:
+            raise ValueError(
+                f"未知的演示缺陷编号 {part!r}；可选：{', '.join(DEFAULT_CANDIDATE_DEFECTS)}，或 none"
+            )
+        ids.add(part)
+    return ids
+
 
 class LoginIn(BaseModel):
     username: str
@@ -59,8 +91,11 @@ class OrderIn(BaseModel):
     quantity: int = 1
 
 
-def create_app(mode: str) -> FastAPI:
+def create_app(mode: str, defects: Optional[set[str]] = None) -> FastAPI:
     assert mode in ("baseline", "candidate"), "mode 必须是 baseline 或 candidate"
+    if defects is None:
+        defects = set(DEFAULT_CANDIDATE_DEFECTS) if mode == "candidate" else set()
+    defects = {str(d).strip().upper() for d in defects}
 
     app = FastAPI(title=f"demo-user-order-{mode}", version="0.1.0")
     state = {
@@ -83,8 +118,8 @@ def create_app(mode: str) -> FastAPI:
 
     @app.get("/api/meta/defects")
     def meta_defects():
-        """列出本服务中人为注入的演示缺陷（仅用于演示说明）。"""
-        return {"mode": mode, "defects": DEFECTS_CANDIDATE if mode == "candidate" else []}
+        """列出本服务中当前生效的人为缺陷（仅用于演示说明）。"""
+        return {"mode": mode, "defects": [d for d in DEFECTS_CANDIDATE if d["id"] in defects]}
 
     @app.post("/api/debug/reset")
     def debug_reset():
@@ -123,7 +158,7 @@ def create_app(mode: str) -> FastAPI:
     ):
         user = user_from_token(authorization)
         if user is None:
-            if mode == "candidate":
+            if "D" in defects:
                 # DEMO DEFECT D: 删掉了登录校验，未登录时直接按 alice 返回订单
                 user = USERS[1]
             else:
@@ -132,8 +167,14 @@ def create_app(mode: str) -> FastAPI:
             orders = [o for o in state["orders"].values() if o["owner_id"] == user["id"]]
         orders.sort(key=lambda o: o["id"])
         if mode == "candidate":
-            # DEMO DEFECT E: 返回结构改成了 {items, total}，但 page/page_size 参数被忽略
-            return {"items": orders, "total": len(orders)}
+            # 新需求：返回 {items, total} 并支持 page/page_size（DEMO DEFECT E 开启时忽略分页）
+            if "E" in defects:
+                items = orders
+            else:
+                page_no = max(page, 1)
+                size = max(page_size, 1)
+                items = orders[(page_no - 1) * size : page_no * size]
+            return {"items": items, "total": len(orders)}
         return {"orders": orders, "count": len(orders)}
 
     @app.get("/api/orders/{order_id}")
@@ -143,7 +184,7 @@ def create_app(mode: str) -> FastAPI:
             raise HTTPException(status_code=401, detail="未登录")
         # 原有问题（baseline 与 candidate 都存在）：不存在的订单直接 KeyError -> 500
         order = state["orders"][order_id]
-        if mode == "candidate":
+        if "A" in defects:
             # DEMO DEFECT A: 删掉了归属校验，任意登录用户可以读取任意订单
             return order
         if order["owner_id"] != user["id"]:
@@ -160,11 +201,11 @@ def create_app(mode: str) -> FastAPI:
         if user is None:
             raise HTTPException(status_code=401, detail="未登录")
         with state["lock"]:
-            if mode == "baseline" and idempotency_key:
+            if "C" not in defects and idempotency_key:
                 existing = state["idempotency"].get(idempotency_key)
                 if existing is not None:
                     return state["orders"][existing]
-            # DEMO DEFECT C: candidate 完全忽略 Idempotency-Key，重复请求会重复创建
+            # DEMO DEFECT C（开启时）: 完全忽略 Idempotency-Key，重复请求会重复创建
             oid = state["next_id"]
             state["next_id"] += 1
             order = {
@@ -184,10 +225,8 @@ def create_app(mode: str) -> FastAPI:
         user = user_from_token(authorization)
         if user is None:
             raise HTTPException(status_code=401, detail="未登录")
-        if mode == "candidate":
-            # DEMO DEFECT B: 删掉了角色校验，普通用户也能调用管理接口
-            pass
-        elif user["role"] != "admin":
+        if "B" not in defects and user["role"] != "admin":
+            # DEMO DEFECT B（开启时）: 删掉角色校验，普通用户也能调用管理接口
             raise HTTPException(status_code=403, detail="需要管理员权限")
         return {
             "users": [

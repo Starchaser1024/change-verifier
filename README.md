@@ -1,5 +1,7 @@
 # 改动验收器（Change Acceptance Verifier）MVP
 
+[![CI](https://github.com/Starchaser1024/change-verifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Starchaser1024/change-verifier/actions/workflows/ci.yml)
+
 用 AI 改完代码后，回答两个问题：**需求真的实现了吗？原有功能被改坏了吗？**
 
 做法：先与用户确认一组**验收规则**（保持原有行为 / 新需求验收），然后在「修改前（baseline）」
@@ -48,8 +50,11 @@ verifier/             验收器本体
   openapi_import.py   OpenAPI 导入
   main.py             FastAPI 应用 + 静态页面
   static/             网页界面（原生 JS，无构建步骤）
-tests/                pytest（分类、执行器、脱敏、LLM 降级、安全限制、端到端演示、API 流程）
-scripts/smoke_check.py 对真实运行中的服务做一次冒烟验收
+tests/                pytest（分类、执行器、脱敏、LLM 降级、安全限制、端到端演示、API 流程、缺陷开关）
+scripts/smoke_check.py    对真实运行中的服务做一次冒烟验收
+scripts/mutation_eval.py  变异评估：注入已知缺陷组合，量化演示规则与引擎的分类偏差
+docs/                 sample_report.md（样例报告）、mutation_eval_results.md（变异评估实测结果）、
+                      blind_test_log.md（真实项目盲测记录模板与合格线）
 run_demo.py          一键启动三个服务
 ```
 
@@ -92,8 +97,14 @@ python -m venv .venv
 6. 点击 **Markdown / JSON** 导出报告。
 7. （可选）点击左侧 **「演示：不可达环境」** 再运行一次：修改后环境指向未启动的端口，
    全部检查会归类为 **「无法判断」** —— 超时/连接失败不会被误判成业务错误。
-8. （可选）把 candidate 服务的缺陷删掉再跑（见 `demo/services.py` 中 `DEMO DEFECT` 注释），
-   验证回归项全部转回「通过」。
+8. （可选）用 `DEMO_DEFECTS` 环境变量控制 candidate 的缺陷子集再跑，验证回归项会随缺陷关闭转为「通过」：
+
+   ```powershell
+   $env:DEMO_DEFECTS="none"; .\.venv\Scripts\python.exe demo\run_candidate.py   # 全部修好
+   $env:DEMO_DEFECTS="A,E";  .\.venv\Scripts\python.exe demo\run_candidate.py   # 只留缺陷 A 和 E
+   ```
+
+   不设置时 = 全部 5 个缺陷开启（与演示一致）。缺陷清单见 <http://127.0.0.1:8621/api/meta/defects>。
 
 不做网页操作也可以直接冒烟验证（三个服务已启动时）：
 
@@ -115,8 +126,11 @@ python -m venv .venv
 2026-10-15 在本机（Windows · Python 3.13.14 · pytest 9.1.1）实际执行 `python -m pytest tests -q`：
 
 ```
-49 passed in 70.01s
+......................................................                   [100%]
+exit code 0（54 个用例，约 75 秒）
 ```
+
+（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。）
 
 | 文件 | 用例数 | 覆盖内容 |
 | --- | --- | --- |
@@ -127,7 +141,8 @@ python -m venv .venv
 | tests/test_api_flow.py | 6 | 规则版本不可变与确认；未出结果导出报告 409；未配置 Key 时 AI 建议明确报错 |
 | tests/test_llm.py | 6 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错 |
 | tests/test_redaction_and_validation.py | 8 | 脱敏（头 / 键名 / 变量值）与规则校验 |
-| tests/test_runner_partial.py | 2 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归 |
+| tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
+| tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
 | tests/test_jsonpath.py | 4 | JSON 路径解析与缺失哨兵 |
 
 另外实际运行过的冒烟验证（真实端口 8620/8621/8622，非测试替身）：
@@ -148,6 +163,32 @@ python -m venv .venv
 网页流程也已用自动化浏览器实际操作验证过一次：创建演示任务 → 运行验收 → 展开「跨用户读取」回归，
 页面并列展示修改前 `403` 与修改后 `200（bob 的订单 102）` 的真实请求响应，0 个控制台错误。
 样例报告见 `docs/sample_report.md`（由上面这次运行导出）。
+
+### 阶段 0 手动验证记录（2026-10-15，真实浏览器操作）
+
+| 验证项 | 结果 | 记录 |
+| --- | --- | --- |
+| 规则编辑器逐字段 | ✅ 通过 | 添加 / 复制 / 删除检查；修改名称、id、类型、期望说明、步骤 JSON、`expected_change_ref` 下拉；「仅保存草稿」→「确认当前版本」→「保存并确认为新版本」；有一处小修：步骤文本框的 label 未与控件关联（无障碍名称为空），已补 `for` |
+| 规则校验拦截 | ✅ 通过 | 非法 JSON 与重复 id 都会报错到界面，且**不会**产生新版本；草稿/已确认两种状态、切换版本（有未保存修改时先确认）都符合预期 |
+| 取消运行 | ✅ 通过（发现并修复 1 个 bug）| 首次实测：运行中取消后，摘要「已执行 N 条」把未执行的检查也算进去了（明细明明写着「检查未执行（运行已取消）」）。已修复：`build_summary` 增加 `executed_checks` 参数、由 runner 传入实际执行数；复测 4 条检查取消后 = 1 条执行、3 条「无法判断（运行已取消）」，摘要「已执行 1 条」 |
+| 浏览器控制台 | ✅ 0 条错误 | 覆盖编辑规则 → 保存/确认版本 → 切换版本 → 运行 → 取消 → 查看结果的完整流程 |
+
+### 信任验证：变异评估（示例服务上的机器测量）
+
+「本次引入的回归」的判断能不能被信任，是整个产品的生命线。在拿不到真实项目盲测之前，
+先用 `scripts/mutation_eval.py` 做机械性测量：把示例服务的 5 个演示缺陷按 9 种组合开关，
+逐个检查验收器是否恰好把「开启的缺陷」判为「本次引入的回归」、把「关闭的缺陷」判为「通过」。
+
+```powershell
+.\.venv\Scripts\python.exe scripts\mutation_eval.py --md docs\mutation_eval_results.md
+```
+
+实测结果（2026-10-15）：**9 个场景 × 10 条检查 = 90 个判定，0 处分类偏差，回归误报 0，回归漏报 0**
+（完整数据见 `docs/mutation_eval_results.md`）。
+
+**这不是真实项目盲测**：缺陷是人为注入的、预期由脚本推导。它证明的是「引擎分类正确 + 这套演示规则
+对这类缺陷有效」，不能代替真实改动上的误报率测试。真实误报率请按 `docs/blind_test_log.md` 的
+盲测协议记录（合格线：回归误报 = 0）。
 
 ## 规则格式（一条检查的 JSON）
 
@@ -198,6 +239,7 @@ python -m venv .venv
 | `VERIFIER_DB` | `verifier_data/verifier.db` | SQLite 路径 |
 | `VERIFIER_HOST` / `VERIFIER_PORT` | `127.0.0.1` / `8622` | 验收器监听地址 |
 | `DEMO_BASELINE_PORT` / `DEMO_CANDIDATE_PORT` | `8620` / `8621` | 两个示例服务端口 |
+| `DEMO_DEFECTS` | 未设置 = 全部 5 个 | candidate 服务的演示缺陷子集（变异评估用）：`A,C` / `none` |
 | `LLM_API_KEY`（或 `OPENAI_API_KEY`/`OPENCODE_API_KEY`） | 无 | 配置后才能用「AI 建议」 |
 | `LLM_BASE_URL` / `LLM_MODEL` | `https://api.openai.com/v1` / `gpt-4o-mini` | OpenAI 兼容接口 |
 
@@ -209,6 +251,8 @@ python -m venv .venv
 - 「无法判断」只区分到「环境/执行问题」这一层；若要区分「测试环境故障 vs 被测代码导致超时」需要更多信息（如服务端日志接入）。
 - LLM 建议的质量取决于模型与需求描述的清晰度；建议必须人工确认，MVP 不做自动确认。
 - 取消运行是「当前请求完成后停止」，不是强杀（httpx 请求不中断）。
+- 变异评估（`scripts/mutation_eval.py`）测的是「人为注入的缺陷 + 程序推导的预期」，只证明引擎与
+  演示规则自洽，**不等于**真实项目的盲测结论；真实误报率必须按 `docs/blind_test_log.md` 记录。
 - 单机单进程执行（后台线程）；没有多用户、并发队列、权限控制，仅适合本地/开发机使用。
 - SQLite 存储与运行历史没有清理策略。
 

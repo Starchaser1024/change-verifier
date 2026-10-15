@@ -321,7 +321,7 @@ function checkCard(c, i, refOptions) {
         <label>行为变化引用（旧行为被新需求替代时填）${refSel}</label>
       </div>
       <label>期望说明<input id="cc-expectation-${i}" value="${esc(c.expectation || "")}"></label>
-      <label style="margin-top:6px">步骤（JSON，含 method/path/headers/json/extract/assert）</label>
+      <label style="margin-top:6px" for="cc-steps-${i}">步骤（JSON，含 method/path/headers/json/extract/assert）</label>
       <textarea id="cc-steps-${i}" rows="${Math.min(18, Math.max(6, stepsJson.split("\n").length))}">${esc(stepsJson)}</textarea>
       ${c._suggestion_errors ? `<div class="err-line">AI 建议存在问题：${esc(c._suggestion_errors.join("；"))}</div>` : ""}
       <div class="cc-tools">

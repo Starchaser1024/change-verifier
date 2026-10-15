@@ -80,6 +80,27 @@ def dead_url():
 
 
 @pytest.fixture(scope="session")
+def start_demo_service():
+    """工厂：按需启动任意缺陷组合的示例服务（供缺陷开关/变异评估测试使用）。"""
+    started: list = []
+
+    def _start(mode: str, defects=None) -> str:
+        from demo.services import create_app
+
+        port = free_port()
+        server, thread = start_server(create_app(mode, defects=defects), port)
+        base = f"http://127.0.0.1:{port}"
+        wait_ready(base)
+        started.append((server, thread))
+        return base
+
+    yield _start
+    for server, thread in started:
+        server.should_exit = True
+        thread.join(5)
+
+
+@pytest.fixture(scope="session")
 def verifier_client(tmp_path_factory):
     os.environ["VERIFIER_DB"] = str(tmp_path_factory.mktemp("verifier_db") / "verifier.db")
     from fastapi.testclient import TestClient

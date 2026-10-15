@@ -111,14 +111,24 @@ def compare_check(check: dict, baseline: dict, candidate: dict, env_results_by_i
     }
 
 
-def build_summary(comparisons: list[dict], total_checks: int, run_status: str, cancelled: bool = False) -> dict:
-    """统计分类数量并生成一句整体结论。"""
+def build_summary(
+    comparisons: list[dict],
+    total_checks: int,
+    run_status: str,
+    cancelled: bool = False,
+    executed_checks: int | None = None,
+) -> dict:
+    """统计分类数量并生成一句整体结论。
+
+    executed_checks 为实际执行过的检查数（未执行的检查也会出现在 comparisons 里，
+    归类为「无法判断」）。不传时回退为 len(comparisons)，便于单独构造 comparisons 的调用方。
+    """
     counts: dict[str, int] = {}
     for cmp in comparisons:
         code = cmp["classification"]["code"]
         counts[code] = counts.get(code, 0) + 1
 
-    executed = len(comparisons)
+    executed = len(comparisons) if executed_checks is None else executed_checks
     notes: list[str] = []
     if counts.get("regression"):
         headline = f"发现 {counts['regression']} 项本次引入的回归，建议修复后再上线"
