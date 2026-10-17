@@ -5,11 +5,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+import pathlib
+import subprocess
+import sys
 
 from verifier import envfile, llm
 
 KEY_VARS = ("LLM_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY")
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _clean(monkeypatch):
@@ -117,3 +122,33 @@ def test_llm_status_source_none_when_unconfigured(monkeypatch):
     _clean(monkeypatch)
     assert llm.llm_status()["source"] is None
     assert llm.llm_status()["available"] is False
+
+
+def test_importing_app_loads_dotenv(tmp_path):
+    """约定：Key 只放 .env —— 无论怎么启动（如 uvicorn verifier.main:app），导入应用就会读到。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("LLM_API_KEY=sk-from-dotenv\nLLM_BASE_URL=https://example.com/v1\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "VERIFIER_ENV_FILE": str(env_file),
+        "VERIFIER_DB": str(tmp_path / "verifier.db"),
+        "PYTHONIOENCODING": "utf-8",
+    }
+    for name in KEY_VARS + ("LLM_BASE_URL", "LLM_MODEL"):
+        env.pop(name, None)
+
+    code = (
+        "import json;"
+        "from verifier.main import app;"  # noqa: F401 - 触发应用模块导入
+        "from verifier.llm import llm_status;"
+        "print(json.dumps(llm_status(), ensure_ascii=True))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True, env=env, timeout=120
+    )
+
+    assert proc.returncode == 0, f"子进程失败：{proc.stderr}"
+    status = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert status["available"] is True
+    assert status["source"] == ".env"
+    assert status["base_url"] == "https://example.com/v1"

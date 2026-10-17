@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__, demo_data
 from .classification import CLASSIFICATION_ORDER, CLASSIFICATION_LABELS
 from .db import get_db, init_db, now_iso, rows_to_dicts
+from .envfile import load_env
 from .llm import LLMError, LLMNotConfigured, llm_status, suggest_checks
 from .models import (
     EndpointIn,
@@ -35,6 +36,12 @@ from .runner import cancel_run, execute_run, register_cancel_event
 log = logging.getLogger("verifier.main")
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# 约定：本地配置（尤其模型 Key）统一放在项目根的 .env，不散落在 shell 里。
+# 这里在应用模块导入时兜底读一次，保证任何启动方式都生效：
+#   python -m verifier / uvicorn verifier.main:app / run_demo.py（子进程会各自再读）
+# 真实环境变量优先于 .env；文件不存在时静默跳过。
+load_env()
 
 app = FastAPI(title="改动验收器", version=__version__)
 init_db()

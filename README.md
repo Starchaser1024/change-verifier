@@ -133,7 +133,7 @@ Copy-Item .env.example .env
 exit code 0（54 个用例，约 75 秒）
 ```
 
-（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持后为 63 个用例。）
+（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持后为 64 个用例。）
 
 | 文件 | 用例数 | 覆盖内容 |
 | --- | --- | --- |
@@ -146,7 +146,7 @@ exit code 0（54 个用例，约 75 秒）
 | tests/test_redaction_and_validation.py | 8 | 脱敏（头 / 键名 / 变量值）与规则校验 |
 | tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
 | tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
-| tests/test_envfile.py | 9 | `.env` 解析（引号/行内注释/`export`/BOM/CRLF）、真实环境变量优先、缺失文件静默、只读解析、Key 来源标记（`.env` vs 环境变量） |
+| tests/test_envfile.py | 10 | `.env` 解析（引号/行内注释/`export`/BOM/CRLF）、真实环境变量优先、缺失文件静默、只读解析、Key 来源标记，以及「导入应用即读取 `.env`」（子进程验证） |
 | tests/test_jsonpath.py | 4 | JSON 路径解析与缺失哨兵 |
 
 另外实际运行过的冒烟验证（真实端口 8620/8621/8622，非测试替身）：
@@ -241,7 +241,9 @@ exit code 0（54 个用例，约 75 秒）
 
 ### 用 `.env` 配置（推荐）
 
-项目根的 `.env` 会被各个启动入口自动读取（`run_demo.py`、`python -m verifier`、两个示例服务**各自**读取）：
+**本项目的约定：本地密钥一律放 `.env`**（不写进代码、不留在 shell 里）。项目根的 `.env`
+会被自动读取，无论用哪种方式启动：`run_demo.py`、`python -m verifier`、直接
+`uvicorn verifier.main:app`；两个示例服务也各自读取（所以 `DEMO_DEFECTS`、端口同样可写在这里）。
 
 ```powershell
 Copy-Item .env.example .env
