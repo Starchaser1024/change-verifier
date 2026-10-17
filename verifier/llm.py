@@ -10,6 +10,7 @@
 - API Key：LLM_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY   任一存在即视为已配置
 - 接口地址：LLM_BASE_URL / OPENAI_BASE_URL / OPENCODE_BASE_URL   默认 https://api.openai.com/v1
 - 模型名：LLM_MODEL / OPENAI_MODEL / OPENCODE_MODEL   默认 gpt-4o-mini
+- 超时：LLM_TIMEOUT / OPENAI_TIMEOUT / OPENCODE_TIMEOUT   默认 180 秒
 
 这些变量可以写在项目根的 `.env` 里（见 verifier/envfile.py）；真实环境变量优先于 `.env`。
 """
@@ -23,9 +24,17 @@ from typing import Any, Callable, Optional
 import httpx
 
 from . import envfile
-from .models import validate_checks
+from .models import ASSERT_TYPES, validate_checks
 
-SYSTEM_PROMPT = """你是一个谨慎的 API 验收规则助手。
+# 把校验器真正接受的 type/op 组合直接拼进提示词。模型很爱自造 eq / gte / max_length 这类
+# 常见写法，一旦写错整条建议会被校验拦下、用户得逐条手改。白名单从 ASSERT_TYPES 生成，
+# 保证提示词与校验器不会各自漂移。
+ASSERT_OPS_HINT = "；".join(
+    f"{atype} 只能用 {' / '.join(sorted(ops))}" for atype, ops in sorted(ASSERT_TYPES.items())
+)
+
+SYSTEM_PROMPT = (
+    """你是一个谨慎的 API 验收规则助手。
 用户会给出「修改需求」、接口清单和已有检查。你的任务只是提出可执行的验收检查建议。
 
 要求：
@@ -34,11 +43,15 @@ SYSTEM_PROMPT = """你是一个谨慎的 API 验收规则助手。
    expectation、steps。existing_behavior 表示「修改前应已正常的原有行为」，new_requirement 表示「修改后需要满足的新行为」。
 3. steps 中每个步骤包含：name、method、path(以/开头)、headers(可选, 值可以是 {{变量}})、json(可选)、timeout(可选, 秒)、
    extract(可选, {变量名: {source: json|header|status|text, path: 提取路径, sensitive: true/false}})、
-   assert(非空数组；元素形如 {"type": "status|json|header|text", "op": "...", "value": ..., "path": "..."})。
-4. 不要编造登录凭据；如需登录，使用占位说明并在 expectation 中注明「凭据待用户填写」。
+   assert(非空数组；元素形如 {"type": "status", "op": "equals", "value": 200} 或
+   {"type": "json", "path": "$.items", "op": "exists"})。
+"""
+    + f"   断言只能使用下面列出的 op，**不要自造**（eq / gte / lte / max_length 这类都不存在）：{ASSERT_OPS_HINT}。\n"
+    + """4. 不要编造登录凭据；如需登录，使用占位说明并在 expectation 中注明「凭据待用户填写」。
 5. 提供 URL 中资源归属类检查时，要写清由谁访问什么资源、期望什么状态码。
 6. 输出 JSON：{"checks": [...]}，不要输出 JSON 之外的内容。
 7. 不要声称任何检查已经通过；你只是提出建议。"""
+)
 
 
 class LLMNotConfigured(RuntimeError):
@@ -52,9 +65,13 @@ class LLMError(RuntimeError):
 KEY_VARS = ("LLM_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY")
 BASE_URL_VARS = ("LLM_BASE_URL", "OPENAI_BASE_URL", "OPENCODE_BASE_URL")
 MODEL_VARS = ("LLM_MODEL", "OPENAI_MODEL", "OPENCODE_MODEL")
+TIMEOUT_VARS = ("LLM_TIMEOUT", "OPENAI_TIMEOUT", "OPENCODE_TIMEOUT")
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
+# 默认给得比较宽：推理模型会先产出大量 reasoning token，实测一次「AI 建议」约 50 秒，
+# 原来 60 秒的上限会让它在负载稍高时随机超时。
+DEFAULT_TIMEOUT = 180.0
 
 
 def _first_set(names: tuple[str, ...]) -> Optional[str]:
@@ -72,6 +89,7 @@ def llm_status() -> dict:
         "available": bool(key),
         "base_url": base_url(),
         "model": model(),
+        "timeout": timeout_seconds(),
         "source": key_source(),
         "hint": "已配置模型 Key，可用于生成检查建议"
         if key
@@ -87,6 +105,21 @@ def base_url() -> str:
 def model() -> str:
     """模型名：LLM_MODEL / OPENAI_MODEL / OPENCODE_MODEL，都没有则用默认。"""
     return _first_set(MODEL_VARS) or DEFAULT_MODEL
+
+
+def timeout_seconds() -> float:
+    """单次模型调用超时（秒）：LLM_TIMEOUT / OPENAI_TIMEOUT / OPENCODE_TIMEOUT。
+
+    解析不出正数就退回默认值（配置写错不该让功能直接不可用）。
+    """
+    raw = _first_set(TIMEOUT_VARS)
+    if raw is None:
+        return DEFAULT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TIMEOUT
+    return value if value > 0 else DEFAULT_TIMEOUT
 
 
 def key_source() -> Optional[str]:
@@ -126,6 +159,7 @@ def suggest_checks(
 
     api_base_url = base_url()
     api_model = model()
+    api_timeout = timeout_seconds()
 
     user_payload = {
         "需求": requirement,
@@ -146,10 +180,16 @@ def suggest_checks(
             f"{api_base_url}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             payload=body,
-            timeout=60,
+            timeout=api_timeout,
         )
     except LLMError:
         raise
+    except httpx.TimeoutException as e:
+        raise LLMError(
+            f"调用模型超时（{api_timeout:g} 秒，模型 {api_model}）：{type(e).__name__}。"
+            "推理模型或输出较长时需要更久，可用 LLM_TIMEOUT 调大（例如 LLM_TIMEOUT=300），"
+            "或换一个更快的模型。"
+        ) from e
     except Exception as e:  # noqa: BLE001 - 网络异常统一暴露
         raise LLMError(f"调用模型失败：{type(e).__name__}: {e}") from e
 

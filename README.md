@@ -133,8 +133,8 @@ Copy-Item .env.example .env
 exit code 0（54 个用例，约 75 秒）
 ```
 
-（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持与
-`OPENAI_*` 别名后为 68 个用例。）
+（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持、
+`OPENAI_*` 别名与可配置超时后为 75 个用例。）
 
 | 文件 | 用例数 | 覆盖内容 |
 | --- | --- | --- |
@@ -143,7 +143,7 @@ exit code 0（54 个用例，约 75 秒）
 | tests/test_classification.py | 10 | 8 种分类、结论优先级、行为变化引用（含引用不通过时仍判回归） |
 | tests/test_safety.py | 3 | 默认只允许本地目标；远程写入需二次确认；非法 URL 拒绝 |
 | tests/test_api_flow.py | 6 | 规则版本不可变与确认；未出结果导出报告 409；未配置 Key 时 AI 建议明确报错 |
-| tests/test_llm.py | 10 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错；`LLM_*`/`OPENAI_*`/`OPENCODE_*` 三套别名的取值与优先级（含空串跳过、地址末尾斜杠归一化、请求确实发到别名地址） |
+| tests/test_llm.py | 17 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错；`LLM_*`/`OPENAI_*`/`OPENCODE_*` 三套别名的取值与优先级（含空串跳过、地址末尾斜杠归一化、请求确实发到别名地址）；超时默认值、可配置、写错回退，以及超时报错里带 `LLM_TIMEOUT` 提示 |
 | tests/test_redaction_and_validation.py | 8 | 脱敏（头 / 键名 / 变量值）与规则校验 |
 | tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
 | tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
@@ -257,6 +257,8 @@ Copy-Item .env.example .env
 - `.env` 已在 `.gitignore` 里，不会进仓库；模板是 `.env.example`。
 - **三类前缀都认**：`LLM_*` / `OPENAI_*` / `OPENCODE_*`（顺序即优先级），所以直接沿用各家 SDK
   习惯的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` 也能生效，不必改名字。
+- **推理模型要留足超时**：`LLM_TIMEOUT` 默认 180 秒。实测某个推理模型（qwen3.8-flash）生成一次
+  建议耗时约 50 秒、其中 2/3 是推理 token，60 秒上限会随机超时；超时报错里会直接提示这个开关。
 - **真实环境变量优先于 `.env`**：临时 `$env:LLM_API_KEY=...` 可以盖住文件里的值。
 - 想换配置文件位置：设置 `VERIFIER_ENV_FILE=路径`。
 - 页面顶栏与 `GET /api/llm/status` 会显示 Key 是否配置、以及**来源**（`.env` 还是系统环境变量）；
@@ -275,6 +277,7 @@ Copy-Item .env.example .env
 | `LLM_API_KEY`（或 `OPENAI_API_KEY` / `OPENCODE_API_KEY`） | 无 | 配置后才能用「AI 建议」 |
 | `LLM_BASE_URL`（或 `OPENAI_BASE_URL` / `OPENCODE_BASE_URL`） | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
 | `LLM_MODEL`（或 `OPENAI_MODEL` / `OPENCODE_MODEL`） | `gpt-4o-mini` | 模型名 |
+| `LLM_TIMEOUT`（或 `OPENAI_TIMEOUT` / `OPENCODE_TIMEOUT`） | `180` | 单次模型调用超时（秒）。推理模型一次建议实测约 50 秒，故默认给得较宽；写错或非正数会退回默认值 |
 
 ## 已知限制（诚实声明）
 
@@ -283,6 +286,9 @@ Copy-Item .env.example .env
 - 需要用户能提供两个可访问的环境；示例服务把状态放在内存里，重启即恢复种子数据。
 - 「无法判断」只区分到「环境/执行问题」这一层；若要区分「测试环境故障 vs 被测代码导致超时」需要更多信息（如服务端日志接入）。
 - LLM 建议的质量取决于模型与需求描述的清晰度；建议必须人工确认，MVP 不做自动确认。
+  提示词已把断言 op 白名单从 `ASSERT_TYPES` 生成进去，能挡掉「自造运算符」这类语法错误；
+  但**语义**错误挡不住 —— 实测见过模型把「条数不超过 2」写成对数组本身做 `less_than 2`
+  （应为长度比较），语法合法、含义不对。这类仍需人工读一遍。
 - 取消运行是「当前请求完成后停止」，不是强杀（httpx 请求不中断）。
 - 变异评估（`scripts/mutation_eval.py`）测的是「人为注入的缺陷 + 程序推导的预期」，只证明引擎与
   演示规则自洽，**不等于**真实项目的盲测结论；真实误报率必须按 `docs/blind_test_log.md` 记录。
