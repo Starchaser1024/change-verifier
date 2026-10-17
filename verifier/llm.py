@@ -5,10 +5,11 @@
 - 模型输出只作为「建议」，必须经用户编辑并确认后才会保存为规则版本。
 - 任何模型调用失败都会把错误原样暴露给用户。
 
-环境变量：
-- LLM_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY   任一存在即视为已配置
-- LLM_BASE_URL   默认 https://api.openai.com/v1
-- LLM_MODEL      默认 gpt-4o-mini
+环境变量（三类前缀都认，按 LLM_ → OPENAI_ → OPENCODE_ 的顺序取第一个非空值，
+方便直接沿用各家 SDK 习惯的名字）：
+- API Key：LLM_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY   任一存在即视为已配置
+- 接口地址：LLM_BASE_URL / OPENAI_BASE_URL / OPENCODE_BASE_URL   默认 https://api.openai.com/v1
+- 模型名：LLM_MODEL / OPENAI_MODEL / OPENCODE_MODEL   默认 gpt-4o-mini
 
 这些变量可以写在项目根的 `.env` 里（见 verifier/envfile.py）；真实环境变量优先于 `.env`。
 """
@@ -48,22 +49,49 @@ class LLMError(RuntimeError):
     pass
 
 
+KEY_VARS = ("LLM_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY")
+BASE_URL_VARS = ("LLM_BASE_URL", "OPENAI_BASE_URL", "OPENCODE_BASE_URL")
+MODEL_VARS = ("LLM_MODEL", "OPENAI_MODEL", "OPENCODE_MODEL")
+
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL = "gpt-4o-mini"
+
+
+def _first_set(names: tuple[str, ...]) -> Optional[str]:
+    """按顺序返回第一个非空的环境变量值（去掉首尾空白）。"""
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 def llm_status() -> dict:
     key = _api_key()
     return {
         "available": bool(key),
-        "base_url": os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
-        "model": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+        "base_url": base_url(),
+        "model": model(),
         "source": key_source(),
         "hint": "已配置模型 Key，可用于生成检查建议"
         if key
-        else "未配置模型 API Key（可在项目根的 .env 里填 LLM_API_KEY，或用环境变量），请手动编写规则",
+        else "未配置模型 API Key（可在项目根的 .env 里填 LLM_API_KEY / OPENAI_API_KEY），请手动编写规则",
     }
+
+
+def base_url() -> str:
+    """接口地址：LLM_BASE_URL / OPENAI_BASE_URL / OPENCODE_BASE_URL，都没有则用默认。"""
+    return (_first_set(BASE_URL_VARS) or DEFAULT_BASE_URL).rstrip("/")
+
+
+def model() -> str:
+    """模型名：LLM_MODEL / OPENAI_MODEL / OPENCODE_MODEL，都没有则用默认。"""
+    return _first_set(MODEL_VARS) or DEFAULT_MODEL
 
 
 def key_source() -> Optional[str]:
     """Key 来自哪里：`.env` / 环境变量 / None（未配置）。"""
-    for name in ("LLM_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY"):
+    for name in KEY_VARS:
         value = os.environ.get(name)
         if value and value.strip():
             return ".env" if envfile.was_loaded(name) else "环境变量"
@@ -71,11 +99,7 @@ def key_source() -> Optional[str]:
 
 
 def _api_key() -> Optional[str]:
-    for name in ("LLM_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY"):
-        value = os.environ.get(name)
-        if value and value.strip():
-            return value.strip()
-    return None
+    return _first_set(KEY_VARS)
 
 
 def _post_json(url: str, headers: dict, payload: dict, timeout: float) -> dict:
@@ -100,8 +124,8 @@ def suggest_checks(
             "你可以手动编写规则，或点击「加载演示规则」参考示例；核心验收流程不依赖模型。"
         )
 
-    base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+    api_base_url = base_url()
+    api_model = model()
 
     user_payload = {
         "需求": requirement,
@@ -109,7 +133,7 @@ def suggest_checks(
         "已有检查（避免重复）": existing_checks or [],
     }
     body = {
-        "model": model,
+        "model": api_model,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -119,7 +143,7 @@ def suggest_checks(
     }
     try:
         data = post_json(
-            f"{base_url}/chat/completions",
+            f"{api_base_url}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             payload=body,
             timeout=60,
@@ -158,4 +182,4 @@ def suggest_checks(
         else:
             valid.append(check)
 
-    return {"checks": valid, "warnings": warnings, "model": model}
+    return {"checks": valid, "warnings": warnings, "model": api_model}

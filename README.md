@@ -133,7 +133,8 @@ Copy-Item .env.example .env
 exit code 0（54 个用例，约 75 秒）
 ```
 
-（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持后为 64 个用例。）
+（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持与
+`OPENAI_*` 别名后为 68 个用例。）
 
 | 文件 | 用例数 | 覆盖内容 |
 | --- | --- | --- |
@@ -142,7 +143,7 @@ exit code 0（54 个用例，约 75 秒）
 | tests/test_classification.py | 10 | 8 种分类、结论优先级、行为变化引用（含引用不通过时仍判回归） |
 | tests/test_safety.py | 3 | 默认只允许本地目标；远程写入需二次确认；非法 URL 拒绝 |
 | tests/test_api_flow.py | 6 | 规则版本不可变与确认；未出结果导出报告 409；未配置 Key 时 AI 建议明确报错 |
-| tests/test_llm.py | 6 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错 |
+| tests/test_llm.py | 10 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错；`LLM_*`/`OPENAI_*`/`OPENCODE_*` 三套别名的取值与优先级（含空串跳过、地址末尾斜杠归一化、请求确实发到别名地址） |
 | tests/test_redaction_and_validation.py | 8 | 脱敏（头 / 键名 / 变量值）与规则校验 |
 | tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
 | tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
@@ -247,16 +248,20 @@ exit code 0（54 个用例，约 75 秒）
 
 ```powershell
 Copy-Item .env.example .env
-# 编辑 .env：
-#   LLM_API_KEY=sk-...
+# 编辑 .env（下面两套名字都认，按 LLM_ → OPENAI_ → OPENCODE_ 的顺序取第一个非空值）：
+#   LLM_API_KEY=sk-...           或  OPENAI_API_KEY=sk-...
 #   LLM_BASE_URL=https://api.openai.com/v1   # 第三方兼容服务按需改
 #   LLM_MODEL=gpt-4o-mini
 ```
 
 - `.env` 已在 `.gitignore` 里，不会进仓库；模板是 `.env.example`。
+- **三类前缀都认**：`LLM_*` / `OPENAI_*` / `OPENCODE_*`（顺序即优先级），所以直接沿用各家 SDK
+  习惯的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` 也能生效，不必改名字。
 - **真实环境变量优先于 `.env`**：临时 `$env:LLM_API_KEY=...` 可以盖住文件里的值。
 - 想换配置文件位置：设置 `VERIFIER_ENV_FILE=路径`。
-- 页面顶栏与 `GET /api/llm/status` 会显示 Key 是否配置、以及**来源**（`.env` 还是系统环境变量）。
+- 页面顶栏与 `GET /api/llm/status` 会显示 Key 是否配置、以及**来源**（`.env` 还是系统环境变量）；
+  同时显示**实际生效**的 `base_url` 与 `model` —— 如果这两项跟你 `.env` 里写的不一致，
+  说明名字没被识别，页面上一眼能看出来。
 
 ### 全部变量
 
@@ -267,8 +272,9 @@ Copy-Item .env.example .env
 | `VERIFIER_HOST` / `VERIFIER_PORT` | `127.0.0.1` / `8622` | 验收器监听地址 |
 | `DEMO_BASELINE_PORT` / `DEMO_CANDIDATE_PORT` | `8620` / `8621` | 两个示例服务端口 |
 | `DEMO_DEFECTS` | 未设置 = 全部 5 个 | candidate 服务的演示缺陷子集（变异评估用）：`A,C` / `none` |
-| `LLM_API_KEY`（或 `OPENAI_API_KEY`/`OPENCODE_API_KEY`） | 无 | 配置后才能用「AI 建议」 |
-| `LLM_BASE_URL` / `LLM_MODEL` | `https://api.openai.com/v1` / `gpt-4o-mini` | OpenAI 兼容接口 |
+| `LLM_API_KEY`（或 `OPENAI_API_KEY` / `OPENCODE_API_KEY`） | 无 | 配置后才能用「AI 建议」 |
+| `LLM_BASE_URL`（或 `OPENAI_BASE_URL` / `OPENCODE_BASE_URL`） | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
+| `LLM_MODEL`（或 `OPENAI_MODEL` / `OPENCODE_MODEL`） | `gpt-4o-mini` | 模型名 |
 
 ## 已知限制（诚实声明）
 
