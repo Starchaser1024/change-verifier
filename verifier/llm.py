@@ -9,6 +9,8 @@
 - LLM_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY   任一存在即视为已配置
 - LLM_BASE_URL   默认 https://api.openai.com/v1
 - LLM_MODEL      默认 gpt-4o-mini
+
+这些变量可以写在项目根的 `.env` 里（见 verifier/envfile.py）；真实环境变量优先于 `.env`。
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from . import envfile
 from .models import validate_checks
 
 SYSTEM_PROMPT = """你是一个谨慎的 API 验收规则助手。
@@ -51,8 +54,20 @@ def llm_status() -> dict:
         "available": bool(key),
         "base_url": os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
         "model": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
-        "hint": "已配置模型 Key，可用于生成检查建议" if key else "未配置模型 API Key（LLM_API_KEY / OPENAI_API_KEY），请手动编写规则",
+        "source": key_source(),
+        "hint": "已配置模型 Key，可用于生成检查建议"
+        if key
+        else "未配置模型 API Key（可在项目根的 .env 里填 LLM_API_KEY，或用环境变量），请手动编写规则",
     }
+
+
+def key_source() -> Optional[str]:
+    """Key 来自哪里：`.env` / 环境变量 / None（未配置）。"""
+    for name in ("LLM_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return ".env" if envfile.was_loaded(name) else "环境变量"
+    return None
 
 
 def _api_key() -> Optional[str]:
@@ -81,7 +96,7 @@ def suggest_checks(
     key = _api_key()
     if not key:
         raise LLMNotConfigured(
-            "未配置模型 API Key（环境变量 LLM_API_KEY 或 OPENAI_API_KEY）。"
+            "未配置模型 API Key（可在项目根的 .env 里填 LLM_API_KEY，或设置环境变量 LLM_API_KEY / OPENAI_API_KEY）。"
             "你可以手动编写规则，或点击「加载演示规则」参考示例；核心验收流程不依赖模型。"
         )
 

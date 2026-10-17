@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 verifier_data/
 .pytest_cache/
+.env
+.env.local

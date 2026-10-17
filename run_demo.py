@@ -4,7 +4,10 @@
     python run_demo.py
 然后浏览器打开 http://127.0.0.1:8622
 
-端口可用环境变量覆盖：DEMO_BASELINE_PORT / DEMO_CANDIDATE_PORT / VERIFIER_PORT。
+配置：启动前会读取项目根的 `.env`（如端口、DEMO_DEFECTS），各子服务启动时**各自**再读一遍
+`.env`（所以 LLM_API_KEY 的来源会如实显示为 `.env`）。真实环境变量优先于 `.env`。
+模板见 `.env.example`。
+端口也可直接用环境变量覆盖：DEMO_BASELINE_PORT / DEMO_CANDIDATE_PORT / VERIFIER_PORT。
 按 Ctrl+C 停止全部服务。
 """
 
@@ -16,6 +19,8 @@ import socket
 import subprocess
 import sys
 import time
+
+from verifier.envfile import parse_env_file
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -32,9 +37,17 @@ def port_is_available(port: int) -> bool:
 
 
 def main() -> int:
-    baseline_port = int(os.environ.get("DEMO_BASELINE_PORT", "8620"))
-    candidate_port = int(os.environ.get("DEMO_CANDIDATE_PORT", "8621"))
-    verifier_port = int(os.environ.get("VERIFIER_PORT", "8622"))
+    file_env = parse_env_file()
+    if file_env:
+        print(f"[run_demo] 发现 .env，包含：{', '.join(sorted(file_env))}（由各服务自行读取）")
+
+    def setting(name: str, default: str) -> str:
+        """优先级：真实环境变量 > .env > 默认值。"""
+        return os.environ.get(name) or file_env.get(name) or default
+
+    baseline_port = int(setting("DEMO_BASELINE_PORT", "8620"))
+    candidate_port = int(setting("DEMO_CANDIDATE_PORT", "8621"))
+    verifier_port = int(setting("VERIFIER_PORT", "8622"))
 
     for name, port in (("baseline", baseline_port), ("candidate", candidate_port), ("验收器", verifier_port)):
         if not port_is_available(port):

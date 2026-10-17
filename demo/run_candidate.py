@@ -5,6 +5,7 @@
     $env:DEMO_DEFECTS="A,C"   # 只保留缺陷 A 和 C
     $env:DEMO_DEFECTS="none"  # 修好全部演示缺陷
 不设置时与演示行为一致（全部 5 个缺陷开启）。
+以上变量也可以写在项目根的 `.env` 里（真实环境变量优先）。
 """
 
 import os
@@ -16,8 +17,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import uvicorn  # noqa: E402
 
 from demo.services import DEFAULT_CANDIDATE_DEFECTS, create_app, parse_defects  # noqa: E402
+from verifier.envfile import load_env  # noqa: E402
 
 if __name__ == "__main__":
+    load_env()
     port = int(os.environ.get("DEMO_CANDIDATE_PORT", "8621"))
     defects = parse_defects(os.environ.get("DEMO_DEFECTS"))
     active = sorted(defects) if defects is not None else sorted(DEFAULT_CANDIDATE_DEFECTS)

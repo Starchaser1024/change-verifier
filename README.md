@@ -67,6 +67,9 @@ cd H:\xin\code\change-verifier
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
+# （可选）配置模型 Key：复制模板，然后编辑 .env 填 LLM_API_KEY
+Copy-Item .env.example .env
+
 # 一键启动三个服务（baseline 8620 / candidate 8621 / 验收器 8622）
 .\.venv\Scripts\python.exe run_demo.py
 ```
@@ -130,7 +133,7 @@ python -m venv .venv
 exit code 0（54 个用例，约 75 秒）
 ```
 
-（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。）
+（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持后为 63 个用例。）
 
 | 文件 | 用例数 | 覆盖内容 |
 | --- | --- | --- |
@@ -143,6 +146,7 @@ exit code 0（54 个用例，约 75 秒）
 | tests/test_redaction_and_validation.py | 8 | 脱敏（头 / 键名 / 变量值）与规则校验 |
 | tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
 | tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
+| tests/test_envfile.py | 9 | `.env` 解析（引号/行内注释/`export`/BOM/CRLF）、真实环境变量优先、缺失文件静默、只读解析、Key 来源标记（`.env` vs 环境变量） |
 | tests/test_jsonpath.py | 4 | JSON 路径解析与缺失哨兵 |
 
 另外实际运行过的冒烟验证（真实端口 8620/8621/8622，非测试替身）：
@@ -172,6 +176,7 @@ exit code 0（54 个用例，约 75 秒）
 | 规则校验拦截 | ✅ 通过 | 非法 JSON 与重复 id 都会报错到界面，且**不会**产生新版本；草稿/已确认两种状态、切换版本（有未保存修改时先确认）都符合预期 |
 | 取消运行 | ✅ 通过（发现并修复 1 个 bug）| 首次实测：运行中取消后，摘要「已执行 N 条」把未执行的检查也算进去了（明细明明写着「检查未执行（运行已取消）」）。已修复：`build_summary` 增加 `executed_checks` 参数、由 runner 传入实际执行数；复测 4 条检查取消后 = 1 条执行、3 条「无法判断（运行已取消）」，摘要「已执行 1 条」 |
 | 浏览器控制台 | ✅ 0 条错误 | 覆盖编辑规则 → 保存/确认版本 → 切换版本 → 运行 → 取消 → 查看结果的完整流程 |
+| AI 建议链路 + `.env` | ✅ 通过 | 用一个本地桩服务冒充模型接口：Key 与 `LLM_BASE_URL` 写进 `.env`，`GET /api/llm/status` 显示 `available: true`、`source: ".env"`；点击「AI 建议」确实发出请求，并把供应商返回的 401 原文（含收到的 Authorization）如实显示在界面上 |
 
 ### 信任验证：变异评估（示例服务上的机器测量）
 
@@ -234,8 +239,28 @@ exit code 0（54 个用例，约 75 秒）
 
 ## 环境变量
 
+### 用 `.env` 配置（推荐）
+
+项目根的 `.env` 会被各个启动入口自动读取（`run_demo.py`、`python -m verifier`、两个示例服务**各自**读取）：
+
+```powershell
+Copy-Item .env.example .env
+# 编辑 .env：
+#   LLM_API_KEY=sk-...
+#   LLM_BASE_URL=https://api.openai.com/v1   # 第三方兼容服务按需改
+#   LLM_MODEL=gpt-4o-mini
+```
+
+- `.env` 已在 `.gitignore` 里，不会进仓库；模板是 `.env.example`。
+- **真实环境变量优先于 `.env`**：临时 `$env:LLM_API_KEY=...` 可以盖住文件里的值。
+- 想换配置文件位置：设置 `VERIFIER_ENV_FILE=路径`。
+- 页面顶栏与 `GET /api/llm/status` 会显示 Key 是否配置、以及**来源**（`.env` 还是系统环境变量）。
+
+### 全部变量
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
+| `VERIFIER_ENV_FILE` | 项目根 `.env` | `.env` 文件路径 |
 | `VERIFIER_DB` | `verifier_data/verifier.db` | SQLite 路径 |
 | `VERIFIER_HOST` / `VERIFIER_PORT` | `127.0.0.1` / `8622` | 验收器监听地址 |
 | `DEMO_BASELINE_PORT` / `DEMO_CANDIDATE_PORT` | `8620` / `8621` | 两个示例服务端口 |
