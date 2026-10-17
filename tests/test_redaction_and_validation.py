@@ -1,3 +1,5 @@
+import pytest
+
 from verifier.models import validate_checks
 from verifier.redaction import REDACTED, mask_text, redact_headers, redact_obj
 
@@ -100,3 +102,23 @@ def test_validate_rejects_empty_asserts_and_bad_timeout():
     text = "\n".join(errors)
     assert "非空数组" in text
     assert "timeout" in text
+
+
+def test_validate_accepts_length_comparison_ops():
+    """「最多 N 条」这类需求要能表达出来。"""
+    c = valid_check()
+    c["steps"][0]["assert"] = [
+        {"type": "json", "path": "$.items", "op": "length_less_than", "value": 3},
+        {"type": "json", "path": "$.items", "op": "length_greater_than", "value": 0},
+    ]
+    assert validate_checks([c]) == []
+
+
+@pytest.mark.parametrize("bad_value", ["2", 2.5, None, True])
+def test_validate_rejects_non_integer_length_value(bad_value):
+    c = valid_check()
+    c["steps"][0]["assert"] = [
+        {"type": "json", "path": "$.items", "op": "length_less_than", "value": bad_value}
+    ]
+    text = "\n".join(validate_checks([c]))
+    assert "必须是整数" in text

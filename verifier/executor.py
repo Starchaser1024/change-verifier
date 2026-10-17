@@ -187,6 +187,10 @@ def evaluate_assertion(a: dict, resp: httpx.Response, resp_json: Any, resp_text:
             ok = isinstance(actual, str) and re.search(str(expected), actual) is not None
         elif op == "length_equals":
             ok = isinstance(actual, (list, tuple, str, dict)) and len(actual) == expected
+        elif op == "length_less_than":
+            ok = isinstance(actual, (list, tuple, str, dict)) and len(actual) < expected
+        elif op == "length_greater_than":
+            ok = isinstance(actual, (list, tuple, str, dict)) and len(actual) > expected
         elif op == "greater_than":
             ok = isinstance(actual, (int, float)) and not isinstance(actual, bool) and actual > expected
         elif op == "less_than":

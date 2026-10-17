@@ -134,17 +134,17 @@ exit code 0（54 个用例，约 75 秒）
 ```
 
 （本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持、
-`OPENAI_*` 别名与可配置超时后为 75 个用例。）
+`OPENAI_*` 别名、可配置超时与长度运算符后为 92 个用例。）
 
 | 文件 | 用例数 | 覆盖内容 |
 | --- | --- | --- |
 | tests/test_e2e_demo.py | 2 | 真实示例服务 + 验收器 API 端到端矩阵（4 回归 / 1 未满足 / 1 原有问题 / 1 行为变化 / 1 满足 / 2 通过）；报告含证据且凭据脱敏；不可达环境全部「无法判断」 |
-| tests/test_executor.py | 8 | 登录提取 token 并复用；断言失败的证据保留；500 是真实响应不算「无法判断」；超时 / 连接失败 / 取消 → 无法判断；模板变量与类型保持 |
+| tests/test_executor.py | 19 | 登录提取 token 并复用；断言失败的证据保留；500 是真实响应不算「无法判断」；超时 / 连接失败 / 取消 → 无法判断；模板变量与类型保持；`length_less_than` / `length_greater_than`（数组 / 字符串 / 对象、非集合与缺失路径判失败），以及「对数组用 less_than 永远失败」这个陷阱的回归测试 |
 | tests/test_classification.py | 10 | 8 种分类、结论优先级、行为变化引用（含引用不通过时仍判回归） |
 | tests/test_safety.py | 3 | 默认只允许本地目标；远程写入需二次确认；非法 URL 拒绝 |
 | tests/test_api_flow.py | 6 | 规则版本不可变与确认；未出结果导出报告 409；未配置 Key 时 AI 建议明确报错 |
-| tests/test_llm.py | 17 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错；`LLM_*`/`OPENAI_*`/`OPENCODE_*` 三套别名的取值与优先级（含空串跳过、地址末尾斜杠归一化、请求确实发到别名地址）；超时默认值、可配置、写错回退，以及超时报错里带 `LLM_TIMEOUT` 提示 |
-| tests/test_redaction_and_validation.py | 8 | 脱敏（头 / 键名 / 变量值）与规则校验 |
+| tests/test_llm.py | 18 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错；`LLM_*`/`OPENAI_*`/`OPENCODE_*` 三套别名的取值与优先级（含空串跳过、地址末尾斜杠归一化、请求确实发到别名地址）；超时默认值、可配置、写错回退，以及超时报错里带 `LLM_TIMEOUT` 提示；提示词的 op 白名单必须覆盖校验器 `ASSERT_TYPES` 里的每一项 |
+| tests/test_redaction_and_validation.py | 13 | 脱敏（头 / 键名 / 变量值）与规则校验；长度运算符的取值校验（字符串 / 小数 / null / 布尔都不接受） |
 | tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
 | tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
 | tests/test_envfile.py | 10 | `.env` 解析（引号/行内注释/`export`/BOM/CRLF）、真实环境变量优先、缺失文件静默、只读解析、Key 来源标记，以及「导入应用即读取 `.env`」（子进程验证） |
@@ -226,7 +226,13 @@ exit code 0（54 个用例，约 75 秒）
 - 变量：`{{nonce}}`（每次运行唯一，用于测试数据隔离）、`{{check_id}}`、`{{env}}`，以及前面步骤 `extract` 出来的变量；
   整个字符串就是一个占位符时保持原始类型（数字不会变字符串）。
 - 断言 `type`：`status`（equals / in）、`json`（equals / not_equals / contains / not_contains / exists / not_exists /
-  type / regex / length_equals / greater_than / less_than / in）、`header`、`text`。
+  type / regex / length_equals / length_less_than / length_greater_than / greater_than / less_than / in）、`header`、`text`。
+- **「最多 N 条」要用长度运算符**：`length_less_than` / `length_greater_than` 比的是**长度**
+  （数组 / 字符串 / 对象都行），`less_than` / `greater_than` 比的是**值本身**。
+  写「items 最多 2 条」应为
+  `{"type": "json", "path": "$.items", "op": "length_less_than", "value": 3}`；
+  若误写成 `{"op": "less_than", "value": 2}`，因为数组不是数字，这条断言会**永远失败**
+  （校验器拦不住这类语义错误，只能靠人读一遍）。
 - `extract.source`：`json`（JSON 路径）、`header`、`status`、`text`（正则）。
 
 ## 安全与隔离设计
@@ -287,8 +293,9 @@ Copy-Item .env.example .env
 - 「无法判断」只区分到「环境/执行问题」这一层；若要区分「测试环境故障 vs 被测代码导致超时」需要更多信息（如服务端日志接入）。
 - LLM 建议的质量取决于模型与需求描述的清晰度；建议必须人工确认，MVP 不做自动确认。
   提示词已把断言 op 白名单从 `ASSERT_TYPES` 生成进去，能挡掉「自造运算符」这类语法错误；
-  但**语义**错误挡不住 —— 实测见过模型把「条数不超过 2」写成对数组本身做 `less_than 2`
-  （应为长度比较），语法合法、含义不对。这类仍需人工读一遍。
+  但**语义**错误挡不住 —— 实测见过模型把「条数不超过 2」写成对数组本身做 `less_than 2`。
+  现已补上 `length_less_than` / `length_greater_than` 并在提示词里写明这条规则，但同类问题
+  （语法合法、含义不对）仍可能换个形式出现，这类只能靠人读一遍。
 - 取消运行是「当前请求完成后停止」，不是强杀（httpx 请求不中断）。
 - 变异评估（`scripts/mutation_eval.py`）测的是「人为注入的缺陷 + 程序推导的预期」，只证明引擎与
   演示规则自洽，**不等于**真实项目的盲测结论；真实误报率必须按 `docs/blind_test_log.md` 记录。

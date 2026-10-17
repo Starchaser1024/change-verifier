@@ -62,6 +62,8 @@ ASSERT_TYPES: dict[str, set[str]] = {
         "type",
         "regex",
         "length_equals",
+        "length_less_than",
+        "length_greater_than",
         "greater_than",
         "less_than",
         "in",
@@ -196,8 +198,9 @@ def validate_check(check: Any, *, index: int = 0) -> list[str]:
                     _err(errors, f"{ap}: status.in 的 value 必须是整数数组")
             if atype == "json" and op == "type" and a["value"] not in _JSON_TYPES:
                 _err(errors, f"{ap}: json.type 的 value 必须是 {sorted(_JSON_TYPES)} 之一")
-            if atype == "json" and op == "length_equals" and not isinstance(a["value"], int):
-                _err(errors, f"{ap}: json.length_equals 的 value 必须是整数")
+            if atype == "json" and op in ("length_equals", "length_less_than", "length_greater_than"):
+                if not isinstance(a["value"], int) or isinstance(a["value"], bool):
+                    _err(errors, f"{ap}: json.{op} 的 value 必须是整数")
             if atype == "json" and op in ("greater_than", "less_than") and not isinstance(a["value"], (int, float)):
                 _err(errors, f"{ap}: json.{op} 的 value 必须是数字")
     return errors

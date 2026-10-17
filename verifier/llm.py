@@ -47,7 +47,10 @@ SYSTEM_PROMPT = (
    {"type": "json", "path": "$.items", "op": "exists"})。
 """
     + f"   断言只能使用下面列出的 op，**不要自造**（eq / gte / lte / max_length 这类都不存在）：{ASSERT_OPS_HINT}。\n"
-    + """4. 不要编造登录凭据；如需登录，使用占位说明并在 expectation 中注明「凭据待用户填写」。
+    + """   比较「条数」「长度」必须用 length_* 系列：要表达「最多 N 条」写
+   {"type": "json", "path": "$.items", "op": "length_less_than", "value": N+1}。
+   greater_than / less_than 比的是**值本身**，用在数组或对象上永远不成立。
+4. 不要编造登录凭据；如需登录，使用占位说明并在 expectation 中注明「凭据待用户填写」。
 5. 提供 URL 中资源归属类检查时，要写清由谁访问什么资源、期望什么状态码。
 6. 输出 JSON：{"checks": [...]}，不要输出 JSON 之外的内容。
 7. 不要声称任何检查已经通过；你只是提出建议。"""
