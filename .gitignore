@@ -1,7 +1,36 @@
-.venv/
-__pycache__/
-*.pyc
-verifier_data/
-.pytest_cache/
+# —— 敏感本地配置（绝不入库）——
+# 约定：本地密钥一律放 .env。模板 .env.example 要保留，故单独放行。
 .env
 .env.local
+.env.*
+!.env.example
+
+# —— 运行时数据（SQLite 里存有运行历史与脱敏证据，不入库）——
+verifier_data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# —— Python ——
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# —— 测试与覆盖率产物 ——
+.pytest_cache/
+.coverage
+htmlcov/
+
+# —— 日志 ——
+*.log
+
+# —— 编辑器 / 操作系统 ——
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
