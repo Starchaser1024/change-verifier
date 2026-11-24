@@ -36,18 +36,24 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, Field
+from .safety import HTTP_METHODS, UNSAFE_METHODS
+from .schemas import (  # noqa: F401 - 保持向后兼容导出
+    EndpointIn,
+    OpenApiImportIn,
+    RuleVersionIn,
+    RunIn,
+    SuggestIn,
+    TaskIn,
+    TaskPatch,
+)
 
 CHECK_CATEGORIES = ("existing_behavior", "new_requirement")
 CATEGORY_LABELS = {
     "existing_behavior": "保持原有行为",
     "new_requirement": "新需求验收",
 }
-
-HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
-UNSAFE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
 ASSERT_TYPES: dict[str, set[str]] = {
     "status": {"equals", "in"},
@@ -232,48 +238,3 @@ def validate_checks(checks: Any) -> list[str]:
                 errors.append(f"检查 {c.get('id')}: expected_change_ref 只能指向「新需求验收」类检查")
     return errors
 
-
-# ------------------------------------------------------------------ API 模型
-
-
-class TaskIn(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    requirement: str = ""
-    baseline_url: str
-    candidate_url: str
-    allow_remote: bool = False
-    allow_remote_writes: bool = False
-
-
-class TaskPatch(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
-    requirement: Optional[str] = None
-    baseline_url: Optional[str] = None
-    candidate_url: Optional[str] = None
-    allow_remote: Optional[bool] = None
-    allow_remote_writes: Optional[bool] = None
-
-
-class EndpointIn(BaseModel):
-    method: str
-    path: str
-    summary: str = ""
-
-
-class OpenApiImportIn(BaseModel):
-    spec_url: Optional[str] = None
-    spec: Optional[dict] = None
-
-
-class RuleVersionIn(BaseModel):
-    checks: list[dict]
-    note: str = ""
-    confirm: bool = False
-
-
-class RunIn(BaseModel):
-    rule_version_id: Optional[int] = None
-
-
-class SuggestIn(BaseModel):
-    endpoint_summaries: Optional[list[str]] = None

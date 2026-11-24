@@ -1,4 +1,8 @@
-"""运行编排：在 baseline / candidate 两个环境执行同一套检查，并分类结果。"""
+"""运行编排：在 baseline / candidate 两个环境执行同一套检查，并分类结果。
+
+- `run_checks(...)`: 纯内存双环境编排，供无头 CLI / CI 门禁与服务端共用。
+- `execute_run(run_id)`: SQLite 持久化包装，逐项落库支持网页实时轮询与中途取消。
+"""
 
 from __future__ import annotations
 
@@ -6,10 +10,11 @@ import json
 import logging
 import secrets
 import threading
+from typing import Callable, Optional
 
 from .classification import build_summary, compare_check
 from .db import get_db, now_iso
-from .executor import UNVERIFIABLE, execute_check
+from .executor import DEFAULT_TIMEOUT_S, UNVERIFIABLE, execute_check
 
 log = logging.getLogger("verifier.runner")
 
@@ -45,6 +50,62 @@ def _unverifiable(env: str, reason: str) -> dict:
     return {"env": env, "status": UNVERIFIABLE, "reason": reason, "steps": []}
 
 
+def run_checks(
+    checks: list[dict],
+    baseline_url: str,
+    candidate_url: str,
+    *,
+    default_timeout: float = DEFAULT_TIMEOUT_S,
+    cancel_event: Optional[threading.Event] = None,
+    on_progress: Optional[Callable[[list[tuple[dict, dict, dict]], str], None]] = None,
+) -> dict:
+    """在 baseline / candidate 上按相同顺序与相同 nonce 执行全部检查并生成分类结果。
+
+    返回字典包含 `status` ("completed" | "cancelled") 与 `payload`（含 `run_nonce`、
+    `partial`、`summary`、`checks`）。
+    """
+    run_nonce = secrets.token_hex(4)
+    env_results: list[tuple[dict, dict, dict]] = []
+
+    for index, check in enumerate(checks):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        baseline = execute_check(
+            check, "baseline", baseline_url, run_nonce, index, default_timeout=default_timeout, cancel_event=cancel_event
+        )
+        candidate = execute_check(
+            check, "candidate", candidate_url, run_nonce, index, default_timeout=default_timeout, cancel_event=cancel_event
+        )
+        env_results.append((check, baseline, candidate))
+        if on_progress is not None:
+            on_progress(env_results, run_nonce)
+
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    final_status = "cancelled" if cancelled else "completed"
+    comparisons = _build_comparisons(
+        checks,
+        env_results,
+        executed_count=len(env_results),
+        unexecuted_reason=CANCELLED_REASON if cancelled else UNEXECUTED_REASON,
+    )
+    summary = build_summary(
+        comparisons,
+        total_checks=len(checks),
+        run_status=final_status,
+        cancelled=cancelled,
+        executed_checks=len(env_results),
+    )
+    return {
+        "status": final_status,
+        "payload": {
+            "run_nonce": run_nonce,
+            "partial": False,
+            "summary": summary,
+            "checks": comparisons,
+        },
+    }
+
+
 def execute_run(run_id: int) -> None:
     """在工作线程中执行一次完整验收。异常会被记录为 run.status='error'。"""
     cancel_event = get_cancel_event(run_id)
@@ -57,61 +118,37 @@ def execute_run(run_id: int) -> None:
             version = conn.execute("SELECT * FROM rule_versions WHERE id = ?", (run["rule_version_id"],)).fetchone()
 
         checks = json.loads(version["checks_json"])
-        run_nonce = secrets.token_hex(4)
-        env_results: list[tuple[dict, dict, dict]] = []
 
-        def save_partial(status: str) -> None:
+        def save_partial(env_results: list[tuple[dict, dict, dict]], run_nonce: str) -> None:
             comparisons = _build_comparisons(
                 checks, env_results, executed_count=len(env_results), unexecuted_reason=RUNNING_REASON
             )
             summary = build_summary(
-                comparisons, total_checks=len(checks), run_status=status, executed_checks=len(env_results)
+                comparisons, total_checks=len(checks), run_status="running", executed_checks=len(env_results)
             )
-            payload = {
+            partial_payload = {
                 "run_nonce": run_nonce,
-                "partial": status == "running",
+                "partial": True,
                 "summary": summary,
                 "checks": comparisons,
             }
             with get_db() as conn:
                 conn.execute(
-                    "UPDATE runs SET result_json = ?, status = ? WHERE id = ?",
-                    (json.dumps(payload, ensure_ascii=False), status, run_id),
+                    "UPDATE runs SET result_json = ?, status = 'running' WHERE id = ?",
+                    (json.dumps(partial_payload, ensure_ascii=False), run_id),
                 )
 
-        for index, check in enumerate(checks):
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            baseline = execute_check(check, "baseline", task["baseline_url"], run_nonce, index, cancel_event=cancel_event)
-            candidate = execute_check(check, "candidate", task["candidate_url"], run_nonce, index, cancel_event=cancel_event)
-            env_results.append((check, baseline, candidate))
-            save_partial("running")  # 逐项更新，网页可实时查看进度
-
-        cancelled = cancel_event is not None and cancel_event.is_set()
-        final_status = "cancelled" if cancelled else "completed"
-        comparisons = _build_comparisons(
+        outcome = run_checks(
             checks,
-            env_results,
-            executed_count=len(env_results),
-            unexecuted_reason=CANCELLED_REASON if cancelled else UNEXECUTED_REASON,
+            task["baseline_url"],
+            task["candidate_url"],
+            cancel_event=cancel_event,
+            on_progress=save_partial,
         )
-        summary = build_summary(
-            comparisons,
-            total_checks=len(checks),
-            run_status=final_status,
-            cancelled=cancelled,
-            executed_checks=len(env_results),
-        )
-        payload = {
-            "run_nonce": run_nonce,
-            "partial": False,
-            "summary": summary,
-            "checks": comparisons,
-        }
         with get_db() as conn:
             conn.execute(
                 "UPDATE runs SET status = ?, result_json = ?, finished_at = ? WHERE id = ?",
-                (final_status, json.dumps(payload, ensure_ascii=False), now_iso(), run_id),
+                (outcome["status"], json.dumps(outcome["payload"], ensure_ascii=False), now_iso(), run_id),
             )
     except Exception as e:  # noqa: BLE001 - 任何异常都要落到 run 记录里，便于排查
         log.exception("run %s failed", run_id)

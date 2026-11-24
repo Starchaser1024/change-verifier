@@ -1,221 +1,275 @@
-# 改动验收器（Change Acceptance Verifier）MVP
+# 改动验收器（Change Acceptance Verifier）
 
 [![CI](https://github.com/Starchaser1024/change-verifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Starchaser1024/change-verifier/actions/workflows/ci.yml)
 
-用 AI 改完代码后，回答两个问题：**需求真的实现了吗？原有功能被改坏了吗？**
+用 AI 改完代码后，用真实请求与可审计证据回答两个核心工程问题：**新需求真的实现了吗？原有功能被改坏了吗？**
 
-做法：先与用户确认一组**验收规则**（保持原有行为 / 新需求验收），然后在「修改前（baseline）」
-和「修改后（candidate）」两个 HTTP 环境上运行**完全相同**的检查，输出分类结论和脱敏后的
-请求 / 响应证据。第一版只做 HTTP API 验收，不做浏览器操作。
+`change-verifier` 先冻结一组**经人工确认的不可变验收规则**（保持原有行为 + 新需求验收），随后在「修改前（`Baseline`）」与「修改后（`Candidate`）」两个 HTTP 环境上运行**完全相同**的多步检查，经敏感凭据脱敏后输出 8 类确定性结论与前后对比证据。同时支持**交互式 Web 工作台**与**无头（Headless）CLI / CI 流水线门禁**。
 
-## 核心原则（已落到实现里）
+> 深入设计细节、状态机推导与安全威胁模型请参阅 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-1. 验收依据 = 用户需求 + 明确接口约定 + **经用户确认**的规则版本（规则按版本存 SQLite，只增不改）。
-2. 运行**永远不会**修改规则 —— 不存在「为了通过测试而改规则」的路径；改规则必须人工编辑并保存为新版本。
-3. 通过与否由可执行断言决定（状态码、JSON 字段、数据归属、重复请求结果……），不只看 HTTP 200。
-4. 报告中的结论关联真实请求与响应证据；证据全部经过脱敏（Authorization/Cookie/密码/token）。
-5. 超时、连接失败归类为「无法判断」，绝不当作业务失败。
-6. 符合已确认新需求的行为变化，标记为「符合已确认需求的行为变化」，不算回归。
-7. 报告明确声明覆盖范围有限，不声称「整个项目正确」或「没有安全漏洞」。
-8. LLM 仅用于**建议**规则；未配置模型 Key 时，手动编写规则、运行、导出报告全部可用，且不会伪造模型输出。
+---
 
-## 结果分类
+## 系统架构与数据流
 
-| 分类 | 含义 |
-| --- | --- |
-| 通过 | 修改前后均通过 |
-| 本次引入的回归 | 修改前通过、修改后失败 |
-| 原有问题 | 修改前后都失败 |
-| 新需求满足 | 新需求检查在修改后通过（修改前可以不满足） |
-| 新需求未满足 | 新需求检查在修改后仍失败 |
-| 符合已确认需求的行为变化 | 旧行为改变，但被一条已确认的新需求检查覆盖（`expected_change_ref`） |
-| 相比修改前已改善 | 修改前失败、修改后通过 |
-| 无法判断 | 服务不可达 / 超时 / 检查未完成（不算通过也不算失败） |
+```mermaid
+flowchart LR
+    subgraph Rules["1. 规则确认与冻结"]
+        Spec["变更需求 / OpenAPI 导入"]
+        LLM["可选 LLM 规则建议 (ASSERT_TYPES 算子白名单)"]
+        Human["人工审查与确认: 不可变规则版本 (SQLite / JSON)"]
+        Spec --> LLM
+        LLM -.->|"建议草稿"| Human
+        Spec --> Human
+    end
+
+    subgraph Runner["2. 双环境同构执行"]
+        Gate["安全守卫 (默认 Loopback + 共享隔离种子 run_nonce)"]
+        Base["Baseline 环境 (修改前 HTTP 服务)"]
+        Cand["Candidate 环境 (修改后 HTTP 服务)"]
+        Human --> Gate
+        Gate --> Base
+        Gate --> Cand
+    end
+
+    subgraph Engine["3. 脱敏与确定性分类"]
+        Redact["敏感信息脱敏引擎 (Headers / JSON Keys / 动态 Token)"]
+        Classify["8 类确定性结论分类器 (PASS / REGRESSION / PRE_EXISTING_FAILURE / REQUIREMENT_MET / REQUIREMENT_UNMET / EXPECTED_BEHAVIOR_CHANGE / IMPROVED / INCONCLUSIVE)"]
+        Base --> Redact
+        Cand --> Redact
+        Redact --> Classify
+    end
+
+    subgraph Output["4. 报告与门禁"]
+        Web["Web 并列证据对比 + Markdown / JSON 报告导出"]
+        CI["Headless CLI 退出码 (0 = 零回归通过, 非 0 = 阻断上线)"]
+        Classify --> Web
+        Classify --> CI
+    end
+```
+
+---
+
+## 核心工程原则
+
+1. **规则版本不可变（Append-Only）**：规则按版本持久化（SQLite `rule_versions` 或受控 JSON 文件），运行期**只读不改**——彻底杜绝「为了跑绿测试而篡改验收标准」。
+2. **可执行多步业务断言**：支持前置登录提取动态变量（如 JWT / 订单号，保留原始 JSON 类型）并注入后续请求，校验状态码、响应头、JSON 路径值/类型/集合长度与归属关系，绝不只看 HTTP 200。
+3. **凭据零落盘泄露**：请求头（`Authorization`/`Cookie`）、敏感键名（`password`/`token`/`secret`/`api_key`）及运行期提取的动态凭据值在落盘和生成报告前统一替换为 `[REDACTED]`。
+4. **环境故障与业务失败严格解耦**：超时、连接拒绝或中途取消一律归类为 `INCONCLUSIVE`（无法判断），绝不误报为业务回归。
+5. **受控的行为演进（`expected_change_ref`）**：旧接口结构按新需求有意调整时，仅当其引用的新需求检查在 `Candidate` **实际验证通过**，才归类为「符合已确认需求的行为变化」；新需求未通过时仍严格判为回归。
+6. **LLM 仅作可选辅助**：未配置 API Key 时，手动编写规则、双环境验收、CLI 门禁与报告导出 100% 可用，绝不伪造模型输出；无头 CI 默认拒绝执行未确认（`draft`）草稿。
+
+---
+
+## 8 类确定性结果分类（Verdict Classifier）
+
+| 分类枚举（架构标准名） | 内部代码 | 中文标签 | 判定条件与工程语义 | CI 默认门禁 |
+| --- | --- | --- | --- | --- |
+| `PASS` | `pass` | 通过 | `existing_behavior` 在修改前后均通过 | 放行 (`0`) |
+| `REGRESSION` | `regression` | 本次引入的回归 | 修改前通过、修改后失败，且未被已通过的新需求覆盖 | **阻断 (`1`)** |
+| `PRE_EXISTING_FAILURE` | `pre_existing` | 原有问题 | 修改前后均失败（历史遗留缺陷，非本次改动引入） | 放行 (`0`) |
+| `REQUIREMENT_MET` | `satisfied` | 新需求满足 | `new_requirement` 检查在修改后环境通过 | 放行 (`0`) |
+| `REQUIREMENT_UNMET` | `not_met` | 新需求未满足 | `new_requirement` 检查在修改后环境仍失败 | **阻断 (`1`)** |
+| `EXPECTED_BEHAVIOR_CHANGE` | `expected_change` | 符合已确认需求的行为变化 | 旧行为断言改变，但 `expected_change_ref` 指向的新需求检查在修改后通过 | 放行 (`0`) |
+| `IMPROVED` | `fixed` | 相比修改前已改善 | `existing_behavior` 在修改前失败、修改后通过 | 放行 (`0`) |
+| `INCONCLUSIVE` | `unverifiable` | 无法判断 | 任一环境服务不可达 / 请求超时 / 运行被取消（不算通过也不算业务失败） | **阻断 (`1`)** |
+
+> CI 门禁可通过 `--fail-on regression` 自定义为「仅拦截回归」（适用于分多个 PR 渐进交付新需求的场景）。
+
+---
 
 ## 目录结构
 
-```
-demo/                 两个本地示例服务（缺陷只存在于这里）
-  services.py         baseline（正确）与 candidate（含 5 个标注缺陷）的同一份实现
-  run_baseline.py     启动修改前环境  http://127.0.0.1:8620
-  run_candidate.py    启动修改后环境  http://127.0.0.1:8621
-verifier/             验收器本体
-  models.py           规则结构 + 校验
-  executor.py         HTTP 执行器（断言、变量提取、超时/取消、脱敏证据）
-  classification.py   结果分类与总体结论
-  runner.py           两环境编排、进度持久化、取消
-  db.py               SQLite（任务 / 规则版本 / 运行记录）
-  report.py           Markdown / JSON 报告
-  llm.py              可选模型建议（无 Key 时明确报错）
-  openapi_import.py   OpenAPI 导入
-  main.py             FastAPI 应用 + 静态页面
-  static/             网页界面（原生 JS，无构建步骤）
-tests/                pytest（分类、执行器、脱敏、LLM 降级、安全限制、端到端演示、API 流程、缺陷开关）
-scripts/smoke_check.py    对真实运行中的服务做一次冒烟验收
-scripts/mutation_eval.py  变异评估：注入已知缺陷组合，量化演示规则与引擎的分类偏差
-docs/                 sample_report.md（样例报告）、mutation_eval_results.md（变异评估实测结果）、
-                      blind_test_log.md（真实项目盲测记录模板与合格线）
-run_demo.py          一键启动三个服务
+```text
+change-verifier/
+├── pyproject.toml              # PEP 621 打包配置与 `change-verifier` 命令行入口
+├── requirements.txt            # 运行与测试依赖清单
+├── run_demo.py                 # 一键启动本地三服务演示栈（等价于 `change-verifier demo`）
+├── verifier/                   # 验收器核心包
+│   ├── cli.py                  # 命令行入口：serve / demo / verify（无头 CI 门禁）
+│   ├── main.py                 # FastAPI 应用工厂与静态资源挂载
+│   ├── routes/                 # 模块化 HTTP 路由层（tasks / rules / runs / deps）
+│   ├── models.py               # 规则 DSL 结构、ASSERT_TYPES 白名单与完整性校验
+│   ├── schemas.py              # HTTP API 请求 Pydantic 模型
+│   ├── safety.py               # 目标 URL 校验与本地回环 / 远程写入安全守卫
+│   ├── executor.py             # 多步 HTTP 执行器（变量提取、类型保持、断言、异常隔离）
+│   ├── redaction.py            # 三层敏感凭据脱敏引擎
+│   ├── jsonpath.py             # JSON 路径解析与 MISSING 哨兵
+│   ├── classification.py       # 8 类确定性结果分类器与结论摘要生成
+│   ├── runner.py               # 双环境同构编排（支持无头内存执行与 SQLite 实时进度持久化）
+│   ├── report.py               # Markdown 与结构化 JSON 脱敏报告渲染
+│   ├── db.py                   # SQLite 存储（任务 / 不可变规则版本 / 运行记录）
+│   ├── llm.py                  # 可选 LLM 规则建议（同源算子白名单 + 无 Key 明确降级）
+│   ├── openapi_import.py       # OpenAPI 3.x 接口清单导入
+│   ├── envfile.py              # 零依赖 `.env` 解析与配置来源追踪
+│   └── static/                 # 原生模块化前端工作台（core / tasks / rules / runs / app.js）
+├── demo/                       # 本地对照演示服务（缺陷仅存在于此，支持 DEMO_DEFECTS 开关）
+│   ├── services.py             # baseline（正确）与 candidate（含 A~E 5 个标注缺陷）同源实现
+│   ├── run_baseline.py         # 启动修改前环境 http://127.0.0.1:8620
+│   └── run_candidate.py        # 启动修改后环境 http://127.0.0.1:8621
+├── scripts/
+│   ├── smoke_check.py          # 针对已启动三服务的端到端 API 冒烟验证
+│   └── mutation_eval.py        # 变异评估：9 种缺陷组合 × 10 条检查量化误报/漏报率
+├── docs/
+│   ├── ARCHITECTURE.md         # 架构设计、8 类判定状态机与威胁模型详解
+│   ├── sample_report.md        # 真实运行导出的脱敏验收报告样例
+│   ├── mutation_eval_results.md# 变异评估实测矩阵（90 次判定 0 误报 / 0 漏报）
+│   └── blind_test_log.md       # 真实项目盲测协议与记录模板
+└── tests/                      # 101 个自动化单元与端到端集成测试
 ```
 
-## 快速启动
+---
 
-Windows（PowerShell），需要 Python 3.10+：
+## 快速安装与启动
+
+需要 Python 3.10+：
 
 ```powershell
-cd H:\xin\code\change-verifier
+git clone https://github.com/Starchaser1024/change-verifier.git
+cd change-verifier
+
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+# 若仅安装列表依赖也可执行：.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# （可选）配置模型 Key：复制模板，然后编辑 .env 填 LLM_API_KEY
+# （可选）配置模型 Key：复制模板后编辑 .env 填入 LLM_API_KEY 或 OPENAI_API_KEY
 Copy-Item .env.example .env
-
-# 一键启动三个服务（baseline 8620 / candidate 8621 / 验收器 8622）
-.\.venv\Scripts\python.exe run_demo.py
 ```
 
-也可以分三个终端启动：
+### 方式一：交互式 Web 验收工作台
+
+一键启动 `baseline(8620)` + `candidate(8621)` + `验收器工作台(8622)`：
 
 ```powershell
-.\.venv\Scripts\python.exe demo\run_baseline.py     # 修改前环境
-.\.venv\Scripts\python.exe demo\run_candidate.py    # 修改后环境（含演示缺陷）
-.\.venv\Scripts\python.exe -m verifier              # 验收器网页
+change-verifier demo
+# 或：python run_demo.py
 ```
 
-## 网页演示操作步骤（完整验收流程）
-
-1. 打开 <http://127.0.0.1:8622>。
-2. 点击左侧 **「创建演示任务」**：自动生成任务（含需求）、接口清单、已确认的演示规则 v1（10 条检查）。
-   *示例服务的 5 个缺陷可通过 <http://127.0.0.1:8621/api/meta/defects> 查看。*
-3. 进入 **「验收规则」** 页：查看 / 编辑规则。可以：
-   - 「加载演示规则」「＋ 添加检查」手动编辑；
-   - 点击「保存并确认为新版本」——规则只增不改，旧版本永久保留；
-   - 点击「AI 建议（可选）」：未配置 `LLM_API_KEY` 时会明确提示「请手动编写规则」，不会伪造结果。
-4. 切到 **「运行与报告」**，点击 **运行验收**：相同的 10 条检查分别在 8620 和 8621 各跑一遍。
-5. 查看结果。预期：
-   - **发现 4 项本次引入的回归**：跨用户读订单、未登录访问订单列表、普通用户调用管理接口、重复创建不幂等；
-   - 1 项新需求满足（`{items,total}` 结构）、1 项新需求未满足（`page_size` 被忽略）；
-   - 1 项符合已确认需求的行为变化（列表结构变更）、1 项原有问题（不存在的订单返回 500）、2 项通过。
-   - 展开任意一条：左「修改前」/ 右「修改后」并列展示请求、响应与逐条断言（密码/token 已脱敏）。
-6. 点击 **Markdown / JSON** 导出报告。
-7. （可选）点击左侧 **「演示：不可达环境」** 再运行一次：修改后环境指向未启动的端口，
-   全部检查会归类为 **「无法判断」** —— 超时/连接失败不会被误判成业务错误。
-8. （可选）用 `DEMO_DEFECTS` 环境变量控制 candidate 的缺陷子集再跑，验证回归项会随缺陷关闭转为「通过」：
-
-   ```powershell
-   $env:DEMO_DEFECTS="none"; .\.venv\Scripts\python.exe demo\run_candidate.py   # 全部修好
-   $env:DEMO_DEFECTS="A,E";  .\.venv\Scripts\python.exe demo\run_candidate.py   # 只留缺陷 A 和 E
-   ```
-
-   不设置时 = 全部 5 个缺陷开启（与演示一致）。缺陷清单见 <http://127.0.0.1:8621/api/meta/defects>。
-
-不做网页操作也可以直接冒烟验证（三个服务已启动时）：
+也可以分终端独立启动：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\smoke_check.py
+python -m demo.run_baseline      # 修改前环境 (8620)
+python -m demo.run_candidate     # 修改后环境 (8621，默认开启 A~E 5 个演示缺陷)
+change-verifier serve            # 验收器网页 (8622，兼容无参数 `python -m verifier`)
 ```
 
-## 运行测试
+打开 <http://127.0.0.1:8622> 即可体验完整闭环：
+1. 点击左侧 **「创建演示任务」**：自动生成需求、接口清单与已确认演示规则 `v1`（10 条检查）。
+2. 在 **「验收规则」** 标签页查看/编辑规则，保存为不可变新版本（或体验无 Key 状态下的诚实降级提示）。
+3. 切到 **「运行与报告」** 点击 **运行验收**：实时查看进度，展开任意检查并列对比修改前 `403` 与修改后 `200` 的脱敏请求/响应证据，并一键导出 Markdown / JSON 报告。
+
+---
+
+### 方式二：无头 CLI 与 CI/CD 流水线门禁（Headless Mode）
+
+除了浏览器界面，`change-verifier verify` 支持直接从 JSON 规则文件或 SQLite 已确认规则版本执行无头验收，零回归返回退出码 `0`，发现回归返回非零退出码 `1`，可直接嵌入 GitHub Actions / GitLab CI：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
+# 1. 使用 JSON 规则文件验收并导出脱敏 Markdown 与 JSON 报告
+change-verifier verify `
+  --rules rules.json `
+  --baseline http://127.0.0.1:8620 `
+  --candidate http://127.0.0.1:8621 `
+  --output acceptance-report.md `
+  --json-output acceptance-report.json
+
+# 2. 使用内置演示规则快速验证（或从 SQLite 指定已确认任务 `--task-id 1`）
+python -m verifier verify `
+  --demo-rules `
+  --baseline http://127.0.0.1:8620 `
+  --candidate http://127.0.0.1:8621 `
+  --output report.md
+
+# 3. 渐进交付模式：仅当出现「本次引入的回归」时阻断流水线
+change-verifier verify `
+  --rules rules.json `
+  --baseline http://127.0.0.1:8620 `
+  --candidate http://127.0.0.1:8621 `
+  --fail-on regression
 ```
 
-测试会自己在随机端口启动真实的 baseline/candidate 服务，通过验收器 API 完成端到端验收，
-并断言：演示矩阵结果分类完全一致、报告不泄露密码与 token、不可达环境全部归类为「无法判断」等。
+**退出码契约**：
+- `0`：验收通过（无 `--fail-on` 中指定的阻断分类；`PRE_EXISTING_FAILURE` 与 `EXPECTED_BEHAVIOR_CHANGE` 均正常放行）。
+- `1`：发现回归或未满足门禁条件（默认阻断 `regression,not_met,unverifiable`）。
+- `2`：规则 JSON 校验不通过、尝试执行未确认（`draft`）草稿规则，或触发非本地环境安全限制。
 
-### 本仓库实际运行过的测试结果
+**GitHub Actions 集成示例**：
 
-2026-10-15 在本机（Windows · Python 3.13.14 · pytest 9.1.1）实际执行 `python -m pytest tests -q`：
-
-```
-......................................................                   [100%]
-exit code 0（54 个用例，约 75 秒）
-```
-
-（本环境终端捕获不到 pytest 的最终总结行，以上为实际输出与退出码。加入 `.env` 支持、
-`OPENAI_*` 别名、可配置超时与长度运算符后为 92 个用例。）
-
-| 文件 | 用例数 | 覆盖内容 |
-| --- | --- | --- |
-| tests/test_e2e_demo.py | 2 | 真实示例服务 + 验收器 API 端到端矩阵（4 回归 / 1 未满足 / 1 原有问题 / 1 行为变化 / 1 满足 / 2 通过）；报告含证据且凭据脱敏；不可达环境全部「无法判断」 |
-| tests/test_executor.py | 19 | 登录提取 token 并复用；断言失败的证据保留；500 是真实响应不算「无法判断」；超时 / 连接失败 / 取消 → 无法判断；模板变量与类型保持；`length_less_than` / `length_greater_than`（数组 / 字符串 / 对象、非集合与缺失路径判失败），以及「对数组用 less_than 永远失败」这个陷阱的回归测试 |
-| tests/test_classification.py | 10 | 8 种分类、结论优先级、行为变化引用（含引用不通过时仍判回归） |
-| tests/test_safety.py | 3 | 默认只允许本地目标；远程写入需二次确认；非法 URL 拒绝 |
-| tests/test_api_flow.py | 6 | 规则版本不可变与确认；未出结果导出报告 409；未配置 Key 时 AI 建议明确报错 |
-| tests/test_llm.py | 18 | 无 Key 明确报错（不伪造）；解析模型输出；坏输出报错；`LLM_*`/`OPENAI_*`/`OPENCODE_*` 三套别名的取值与优先级（含空串跳过、地址末尾斜杠归一化、请求确实发到别名地址）；超时默认值、可配置、写错回退，以及超时报错里带 `LLM_TIMEOUT` 提示；提示词的 op 白名单必须覆盖校验器 `ASSERT_TYPES` 里的每一项 |
-| tests/test_redaction_and_validation.py | 13 | 脱敏（头 / 键名 / 变量值）与规则校验；长度运算符的取值校验（字符串 / 小数 / null / 布尔都不接受） |
-| tests/test_runner_partial.py | 3 | 未执行检查 → 无法判断；引用未执行的新需求检查不能洗白回归；取消后「已执行」只计真实执行数 |
-| tests/test_defect_toggles.py | 4 | `DEMO_DEFECTS` 解析（含拼错报错）；candidate 无缺陷时与正确实现一致；单缺陷只影响自身行为；baseline 永远无缺陷 |
-| tests/test_envfile.py | 10 | `.env` 解析（引号/行内注释/`export`/BOM/CRLF）、真实环境变量优先、缺失文件静默、只读解析、Key 来源标记，以及「导入应用即读取 `.env`」（子进程验证） |
-| tests/test_jsonpath.py | 4 | JSON 路径解析与缺失哨兵 |
-
-另外实际运行过的冒烟验证（真实端口 8620/8621/8622，非测试替身）：
-
-```
-> python scripts/smoke_check.py
-[ok] 运行状态：completed
-[ok] 结论：发现 4 项本次引入的回归，建议修复后再上线
-     符合已确认需求的行为变化: 1
-     新需求未满足: 1
-     通过: 2
-     原有问题: 1
-     本次引入的回归: 4
-     新需求满足: 1
-[ok] Markdown 报告不含演示密码（已脱敏）
+```yaml
+- name: Run Change Acceptance Gate
+  run: |
+    python -m verifier verify \
+      --rules .ci/acceptance_rules.json \
+      --baseline http://127.0.0.1:8620 \
+      --candidate http://127.0.0.1:8621 \
+      --output "$GITHUB_STEP_SUMMARY" \
+      --json-output acceptance-report.json
 ```
 
-网页流程也已用自动化浏览器实际操作验证过一次：创建演示任务 → 运行验收 → 展开「跨用户读取」回归，
-页面并列展示修改前 `403` 与修改后 `200（bob 的订单 102）` 的真实请求响应，0 个控制台错误。
-样例报告见 `docs/sample_report.md`（由上面这次运行导出）。
+---
 
-### 阶段 0 手动验证记录（2026-10-15，真实浏览器操作）
+## 变异评估与测试验证
 
-| 验证项 | 结果 | 记录 |
-| --- | --- | --- |
-| 规则编辑器逐字段 | ✅ 通过 | 添加 / 复制 / 删除检查；修改名称、id、类型、期望说明、步骤 JSON、`expected_change_ref` 下拉；「仅保存草稿」→「确认当前版本」→「保存并确认为新版本」；有一处小修：步骤文本框的 label 未与控件关联（无障碍名称为空），已补 `for` |
-| 规则校验拦截 | ✅ 通过 | 非法 JSON 与重复 id 都会报错到界面，且**不会**产生新版本；草稿/已确认两种状态、切换版本（有未保存修改时先确认）都符合预期 |
-| 取消运行 | ✅ 通过（发现并修复 1 个 bug）| 首次实测：运行中取消后，摘要「已执行 N 条」把未执行的检查也算进去了（明细明明写着「检查未执行（运行已取消）」）。已修复：`build_summary` 增加 `executed_checks` 参数、由 runner 传入实际执行数；复测 4 条检查取消后 = 1 条执行、3 条「无法判断（运行已取消）」，摘要「已执行 1 条」 |
-| 浏览器控制台 | ✅ 0 条错误 | 覆盖编辑规则 → 保存/确认版本 → 切换版本 → 运行 → 取消 → 查看结果的完整流程 |
-| AI 建议链路 + `.env` | ✅ 通过 | 用一个本地桩服务冒充模型接口：Key 与 `LLM_BASE_URL` 写进 `.env`，`GET /api/llm/status` 显示 `available: true`、`source: ".env"`；点击「AI 建议」确实发出请求，并把供应商返回的 401 原文（含收到的 Authorization）如实显示在界面上 |
+### 1. 缺陷变异评估（Mutation Evaluation）
 
-### 信任验证：变异评估（示例服务上的机器测量）
-
-「本次引入的回归」的判断能不能被信任，是整个产品的生命线。在拿不到真实项目盲测之前，
-先用 `scripts/mutation_eval.py` 做机械性测量：把示例服务的 5 个演示缺陷按 9 种组合开关，
-逐个检查验收器是否恰好把「开启的缺陷」判为「本次引入的回归」、把「关闭的缺陷」判为「通过」。
+「本次引入的回归」能否做到零误报，是验收工具的生命线。`scripts/mutation_eval.py` 将示例服务的 5 类典型 AI 改动缺陷（`A` 跨用户越权读、`B` 管理接口漏鉴权、`C` 幂等键失效、`D` 匿名访问泄露、`E` 分页参数忽略）按 **9 种组合**逐一开关，量化引擎与规则集的判定准确性：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\mutation_eval.py --md docs\mutation_eval_results.md
+python scripts/mutation_eval.py --md docs/mutation_eval_results.md
 ```
 
-实测结果（2026-10-15）：**9 个场景 × 10 条检查 = 90 个判定，0 处分类偏差，回归误报 0，回归漏报 0**
-（完整数据见 `docs/mutation_eval_results.md`）。
+**实测结果**：
+- **9 种缺陷组合 × 10 条验收检查 = 90 次跨环境判定**
+- **分类偏差：`0` 处 · 回归误报（False Positives）：`0` · 回归漏报（False Negatives）：`0`**
+- 完整矩阵见 [`docs/mutation_eval_results.md`](docs/mutation_eval_results.md)；真实项目盲测协议见 [`docs/blind_test_log.md`](docs/blind_test_log.md)。
 
-**这不是真实项目盲测**：缺陷是人为注入的、预期由脚本推导。它证明的是「引擎分类正确 + 这套演示规则
-对这类缺陷有效」，不能代替真实改动上的误报率测试。真实误报率请按 `docs/blind_test_log.md` 的
-盲测协议记录（合格线：回归误报 = 0）。
+### 2. 自动化测试套件
 
-## 规则格式（一条检查的 JSON）
+```powershell
+python -m pytest -q
+```
+
+测试套件在随机端口拉起真实的 `baseline` / `candidate` 服务进行端到端验证（共 **12 个测试模块、101 个测试用例**）：
+
+| 测试文件 | 覆盖重点 |
+| --- | --- |
+| `tests/test_e2e_demo.py` | 真实双服务 + 验收器端到端矩阵（4 回归 / 1 未满足 / 1 原有问题 / 1 行为变化 / 1 满足 / 2 通过）、脱敏验证、不可达环境全量判 `unverifiable` |
+| `tests/test_cli.py` | 无头 CLI（JSON 规则 / SQLite 确认版本强制拦截草稿 / URL 覆盖 / 退出码 `0`·`1`·`2` / `--fail-on` / 远程安全限制 / 子进程调用 / 模块化前端静态资源） |
+| `tests/test_executor.py` | 登录提取 Token 传递、500 归为真实响应而非 `unverifiable`、超时/断连/取消隔离、占位符原始类型保持、`length_*` 集合长度算子 |
+| `tests/test_classification.py` | 8 类结论映射、摘要结论优先级、`expected_change_ref` 防洗白校验 |
+| `tests/test_redaction_and_validation.py` | 三层脱敏（请求头 / 嵌套敏感键 / 动态提取凭据字面替换）与规则结构校验 |
+| `tests/test_llm.py` | 无 Key 诚实报错、`LLM_*`/`OPENAI_*`/`OPENCODE_*` 优先级、超时提示、`SYSTEM_PROMPT` 与 `ASSERT_TYPES` 白名单同源校验 |
+| `tests/test_api_flow.py` | 任务创建、规则不可变版本递增与确认、未完成运行导出报告返回 `409` |
+| `tests/test_runner_partial.py` | 中途取消后未执行检查归为 `unverifiable`、实际执行计数准确性 |
+| `tests/test_safety.py` | 默认仅限本地回环地址、远程访问与远程写入二次确认拦截 |
+| `tests/test_defect_toggles.py` | `DEMO_DEFECTS` 缺陷开关解析、正交隔离性与 `baseline` 零缺陷保证 |
+| `tests/test_envfile.py` | 零依赖 `.env` 解析（BOM/引号/注释/`export`）、系统环境变量优先、导入应用自动加载验证 |
+| `tests/test_jsonpath.py` | JSONPath 嵌套数组提取与 `MISSING` 缺失哨兵 |
+
+---
+
+## 规则格式示例
 
 ```json
 {
   "id": "read-other-order-denied",
   "name": "用户 A 不能读取用户 B 的订单",
-  "category": "existing_behavior",          // 或 new_requirement
+  "category": "existing_behavior",
   "expectation": "alice 读取 bob 的订单 102 必须返回 403",
-  "expected_change_ref": null,              // 旧行为被新需求替代时，填新需求检查的 id
+  "expected_change_ref": null,
   "steps": [
     {
       "name": "登录",
-      "method": "POST", "path": "/api/login",
+      "method": "POST",
+      "path": "/api/login",
       "json": {"username": "alice", "password": "alice-password"},
       "extract": {"token": {"source": "json", "path": "$.access_token", "sensitive": true}},
       "assert": [{"type": "status", "op": "equals", "value": 200}]
     },
     {
       "name": "读取 bob 的订单",
-      "method": "GET", "path": "/api/orders/102",
+      "method": "GET",
+      "path": "/api/orders/102",
       "headers": {"Authorization": "Bearer {{token}}"},
       "assert": [{"type": "status", "op": "equals", "value": 403}]
     }
@@ -223,89 +277,36 @@ exit code 0（54 个用例，约 75 秒）
 }
 ```
 
-- 变量：`{{nonce}}`（每次运行唯一，用于测试数据隔离）、`{{check_id}}`、`{{env}}`，以及前面步骤 `extract` 出来的变量；
-  整个字符串就是一个占位符时保持原始类型（数字不会变字符串）。
-- 断言 `type`：`status`（equals / in）、`json`（equals / not_equals / contains / not_contains / exists / not_exists /
-  type / regex / length_equals / length_less_than / length_greater_than / greater_than / less_than / in）、`header`、`text`。
-- **「最多 N 条」要用长度运算符**：`length_less_than` / `length_greater_than` 比的是**长度**
-  （数组 / 字符串 / 对象都行），`less_than` / `greater_than` 比的是**值本身**。
-  写「items 最多 2 条」应为
-  `{"type": "json", "path": "$.items", "op": "length_less_than", "value": 3}`；
-  若误写成 `{"op": "less_than", "value": 2}`，因为数组不是数字，这条断言会**永远失败**
-  （校验器拦不住这类语义错误，只能靠人读一遍）。
-- `extract.source`：`json`（JSON 路径）、`header`、`status`、`text`（正则）。
+- **内置与提取变量**：支持 `{{nonce}}`（每次运行唯一，隔离写入数据）、`{{check_id}}`、`{{env}}` 及前置步骤 `extract` 的变量；若整个字符串恰为单个占位符（如 `"{{first_order_id}}"`），自动保持原始数字/布尔类型。
+- **断言算子（`ASSERT_TYPES`）**：
+  - `status`: `equals`, `in`
+  - `json`: `exists`, `not_exists`, `equals`, `not_equals`, `contains`, `not_contains`, `type`, `regex`, `length_equals`, `length_less_than`, `length_greater_than`, `greater_than`, `less_than`, `in`
+  - `header`: `exists`, `not_exists`, `equals`, `contains`, `not_contains`, `regex`
+  - `text`: `contains`, `not_contains`, `regex`
 
-## 安全与隔离设计
+---
 
-- **默认只允许操作本地环境**：目标不是 `127.0.0.1/localhost` 时拒绝运行，除非在任务里显式开启
-  「允许远程环境」；即使开启，远程**写入**（POST/PUT/PATCH/DELETE）还需要再开「允许远程写入」。
-- **检查之间隔离**：写操作使用 `{{nonce}}`（每次运行唯一）标记的测试数据，检查之间彼此独立；
-  只读检查引用两个服务一致的种子数据（相同订单号）。示例服务提供 `POST /api/debug/reset` 恢复种子数据。
-- **凭据不落库、不进报告**：证据在写入 SQLite 前就完成脱敏；`Authorization/Cookie/Set-Cookie` 等头、
-  键名含 `password/token/secret/api_key` 的字段、以及运行中提取出的敏感变量值，全部替换为 `[REDACTED]`。
+## 环境变量说明
 
-## 环境变量
+项目根目录的 `.env` 会被自动加载（真实系统环境变量优先级高于 `.env`）：
 
-### 用 `.env` 配置（推荐）
-
-**本项目的约定：本地密钥一律放 `.env`**（不写进代码、不留在 shell 里）。项目根的 `.env`
-会被自动读取，无论用哪种方式启动：`run_demo.py`、`python -m verifier`、直接
-`uvicorn verifier.main:app`；两个示例服务也各自读取（所以 `DEMO_DEFECTS`、端口同样可写在这里）。
-
-```powershell
-Copy-Item .env.example .env
-# 编辑 .env（下面两套名字都认，按 LLM_ → OPENAI_ → OPENCODE_ 的顺序取第一个非空值）：
-#   LLM_API_KEY=sk-...           或  OPENAI_API_KEY=sk-...
-#   LLM_BASE_URL=https://api.openai.com/v1   # 第三方兼容服务按需改
-#   LLM_MODEL=gpt-4o-mini
-```
-
-- `.env` 已在 `.gitignore` 里，不会进仓库；模板是 `.env.example`。
-- **三类前缀都认**：`LLM_*` / `OPENAI_*` / `OPENCODE_*`（顺序即优先级），所以直接沿用各家 SDK
-  习惯的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` 也能生效，不必改名字。
-- **推理模型要留足超时**：`LLM_TIMEOUT` 默认 180 秒。实测某个推理模型（qwen3.8-flash）生成一次
-  建议耗时约 50 秒、其中 2/3 是推理 token，60 秒上限会随机超时；超时报错里会直接提示这个开关。
-- **真实环境变量优先于 `.env`**：临时 `$env:LLM_API_KEY=...` 可以盖住文件里的值。
-- 想换配置文件位置：设置 `VERIFIER_ENV_FILE=路径`。
-- 页面顶栏与 `GET /api/llm/status` 会显示 Key 是否配置、以及**来源**（`.env` 还是系统环境变量）；
-  同时显示**实际生效**的 `base_url` 与 `model` —— 如果这两项跟你 `.env` 里写的不一致，
-  说明名字没被识别，页面上一眼能看出来。
-
-### 全部变量
-
-| 变量 | 默认 | 说明 |
+| 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
-| `VERIFIER_ENV_FILE` | 项目根 `.env` | `.env` 文件路径 |
-| `VERIFIER_DB` | `verifier_data/verifier.db` | SQLite 路径 |
-| `VERIFIER_HOST` / `VERIFIER_PORT` | `127.0.0.1` / `8622` | 验收器监听地址 |
-| `DEMO_BASELINE_PORT` / `DEMO_CANDIDATE_PORT` | `8620` / `8621` | 两个示例服务端口 |
-| `DEMO_DEFECTS` | 未设置 = 全部 5 个 | candidate 服务的演示缺陷子集（变异评估用）：`A,C` / `none` |
-| `LLM_API_KEY`（或 `OPENAI_API_KEY` / `OPENCODE_API_KEY`） | 无 | 配置后才能用「AI 建议」 |
-| `LLM_BASE_URL`（或 `OPENAI_BASE_URL` / `OPENCODE_BASE_URL`） | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
-| `LLM_MODEL`（或 `OPENAI_MODEL` / `OPENCODE_MODEL`） | `gpt-4o-mini` | 模型名 |
-| `LLM_TIMEOUT`（或 `OPENAI_TIMEOUT` / `OPENCODE_TIMEOUT`） | `180` | 单次模型调用超时（秒）。推理模型一次建议实测约 50 秒，故默认给得较宽；写错或非正数会退回默认值 |
+| `VERIFIER_ENV_FILE` | `.env` | 自定义 `.env` 文件路径 |
+| `VERIFIER_DB` | `verifier_data/verifier.db` | SQLite 数据库文件路径 |
+| `VERIFIER_HOST` / `VERIFIER_PORT` | `127.0.0.1` / `8622` | 验收器 Web 服务监听地址与端口 |
+| `DEMO_BASELINE_PORT` / `DEMO_CANDIDATE_PORT` | `8620` / `8621` | 本地演示服务端口 |
+| `DEMO_DEFECTS` | 未设置（开启全部 5 个） | `candidate` 演示缺陷开关：`none` 或逗号分隔如 `A,E` |
+| `LLM_API_KEY`（兼容 `OPENAI_API_KEY` / `OPENCODE_API_KEY`） | 空 | 可选：配置后启用 Web 端「AI 建议」 |
+| `LLM_BASE_URL`（兼容 `OPENAI_BASE_URL` / `OPENCODE_BASE_URL`） | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
+| `LLM_MODEL`（兼容 `OPENAI_MODEL` / `OPENCODE_MODEL`） | `gpt-4o-mini` | 模型名称 |
+| `LLM_TIMEOUT`（兼容 `OPENAI_TIMEOUT` / `OPENCODE_TIMEOUT`） | `180` | 单次模型建议调用超时（秒） |
 
-## 已知限制（诚实声明）
+---
 
-- 只覆盖网页上列出的检查项，不代表整个项目正确，也不代表没有安全漏洞。
-- 只支持 HTTP API 验收；不做浏览器操作、不做并发/性能/稳定性验证。
-- 需要用户能提供两个可访问的环境；示例服务把状态放在内存里，重启即恢复种子数据。
-- 「无法判断」只区分到「环境/执行问题」这一层；若要区分「测试环境故障 vs 被测代码导致超时」需要更多信息（如服务端日志接入）。
-- LLM 建议的质量取决于模型与需求描述的清晰度；建议必须人工确认，MVP 不做自动确认。
-  提示词已把断言 op 白名单从 `ASSERT_TYPES` 生成进去，能挡掉「自造运算符」这类语法错误；
-  但**语义**错误挡不住 —— 实测见过模型把「条数不超过 2」写成对数组本身做 `less_than 2`。
-  现已补上 `length_less_than` / `length_greater_than` 并在提示词里写明这条规则，但同类问题
-  （语法合法、含义不对）仍可能换个形式出现，这类只能靠人读一遍。
-- 取消运行是「当前请求完成后停止」，不是强杀（httpx 请求不中断）。
-- 变异评估（`scripts/mutation_eval.py`）测的是「人为注入的缺陷 + 程序推导的预期」，只证明引擎与
-  演示规则自洽，**不等于**真实项目的盲测结论；真实误报率必须按 `docs/blind_test_log.md` 记录。
-- 单机单进程执行（后台线程）；没有多用户、并发队列、权限控制，仅适合本地/开发机使用。
-- SQLite 存储与运行历史没有清理策略。
+## 已知边界与诚实声明
 
-## 下一步最值得验证的用户需求
-
-1. **真实项目的规则编写成本**：独立开发者愿不愿意为每次改动写 3~10 条规则？先观察「AI 建议 + 人工确认」是否显著降低门槛。
-2. **回归判定是否被信任**：「本次引入的回归」的误报率是第一生命线；建议先用真实 git 改动做 5~10 次盲测。
-3. **环境准备**：真实项目通常需要跑迁移/造数据/起服务，验证是否需要在任务上加「环境准备步骤（setup）Hook」。
-4. **报告落地场景**：报告是否会真的被贴进 PR / 给 AI 助手回喂修复指令？这决定报告的字段与格式优先级。
-5. **规则自然语言化**：用户能否接受「先写自然语言验收点，再翻译成步骤」，还是直接编辑 JSON 更顺手。
+- **覆盖范围边界**：验收结论仅对规则版本中显式列出的检查项负责，不声称「整个系统无缺陷」或「不存在安全漏洞」。
+- **协议范围**：专注 HTTP/JSON API 行为验收，不涉及浏览器 UI 渲染、高并发压测或混沌工程注入。
+- **环境故障粒度**：`INCONCLUSIVE`（`unverifiable`）能可靠隔离网络不可达与超时，但区分「基础设施故障」与「被测代码死循环导致超时」仍需结合服务端日志。
+- **变异评估边界**：`scripts/mutation_eval.py` 验证的是引擎分类确定性与演示规则集的有效性，不能替代真实业务仓库上的盲测（见 [`docs/blind_test_log.md`](docs/blind_test_log.md)）。

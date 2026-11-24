@@ -14,9 +14,11 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime
 import os
 import pathlib
+import shutil
 import socket
 import sys
 import tempfile
@@ -28,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 # 独立的临时数据库，避免污染本地 verifier_data/
 _TMP_DB_DIR = tempfile.mkdtemp(prefix="mutation_eval_")
+atexit.register(shutil.rmtree, _TMP_DB_DIR, True)
 os.environ["VERIFIER_DB"] = str(pathlib.Path(_TMP_DB_DIR) / "verifier.db")
 
 import httpx  # noqa: E402

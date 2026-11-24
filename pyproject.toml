@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "change-verifier"
+version = "0.1.0"
+description = "Dual-environment HTTP API change acceptance verifier with immutable rule versions, sensitive-data redaction, and 8-category regression classification."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+change-verifier = "verifier.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["verifier*", "demo*"]
+
+[tool.setuptools.package-data]
+verifier = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
