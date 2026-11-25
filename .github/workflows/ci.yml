@@ -28,3 +28,49 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: 运行测试
         run: python -m pytest tests -q
+
+  acceptance-gate:
+    name: Headless Acceptance Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: 安装依赖与命令行入口
+        run: python -m pip install -e ".[dev]"
+      - name: 执行零回归无头验收并写入摘要
+        run: |
+          change-verifier verify \
+            --demo-rules \
+            --baseline-cmd "python -m demo.run_baseline" \
+            --candidate-cmd "python -m demo.run_candidate" \
+            --candidate-env DEMO_DEFECTS=none \
+            --output acceptance-report.md \
+            --json-output acceptance-report.json
+          cat acceptance-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: 验证回归检测阻断退出码
+        run: |
+          set +e
+          change-verifier verify \
+            --demo-rules \
+            --baseline-cmd "python -m demo.run_baseline" \
+            --candidate-cmd "python -m demo.run_candidate" \
+            --candidate-env DEMO_DEFECTS=A,C \
+            --quiet
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "预期检测到回归时返回退出码 1，实际返回 $code" >&2
+            exit 1
+          fi
+      - name: 上传脱敏验收报告构件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-reports
+          path: |
+            acceptance-report.md
+            acceptance-report.json
+          retention-days: 14

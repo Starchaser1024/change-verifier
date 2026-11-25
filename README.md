@@ -113,8 +113,7 @@ change-verifier/
 ├── docs/
 │   ├── ARCHITECTURE.md         # 架构设计、8 类判定状态机与威胁模型详解
 │   ├── sample_report.md        # 真实运行导出的脱敏验收报告样例
-│   ├── mutation_eval_results.md# 变异评估实测矩阵（90 次判定 0 误报 / 0 漏报）
-│   └── blind_test_log.md       # 真实项目盲测协议与记录模板
+│   └── mutation_eval_results.md# 变异评估实测矩阵（90 次判定 0 误报 / 0 漏报）
 └── tests/                      # 101 个自动化单元与端到端集成测试
 ```
 
@@ -221,7 +220,7 @@ python scripts/mutation_eval.py --md docs/mutation_eval_results.md
 **实测结果**：
 - **9 种缺陷组合 × 10 条验收检查 = 90 次跨环境判定**
 - **分类偏差：`0` 处 · 回归误报（False Positives）：`0` · 回归漏报（False Negatives）：`0`**
-- 完整矩阵见 [`docs/mutation_eval_results.md`](docs/mutation_eval_results.md)；真实项目盲测协议见 [`docs/blind_test_log.md`](docs/blind_test_log.md)。
+- 完整矩阵见 [`docs/mutation_eval_results.md`](docs/mutation_eval_results.md)。
 
 ### 2. 自动化测试套件
 
@@ -309,4 +308,4 @@ python -m pytest -q
 - **覆盖范围边界**：验收结论仅对规则版本中显式列出的检查项负责，不声称「整个系统无缺陷」或「不存在安全漏洞」。
 - **协议范围**：专注 HTTP/JSON API 行为验收，不涉及浏览器 UI 渲染、高并发压测或混沌工程注入。
 - **环境故障粒度**：`INCONCLUSIVE`（`unverifiable`）能可靠隔离网络不可达与超时，但区分「基础设施故障」与「被测代码死循环导致超时」仍需结合服务端日志。
-- **变异评估边界**：`scripts/mutation_eval.py` 验证的是引擎分类确定性与演示规则集的有效性，不能替代真实业务仓库上的盲测（见 [`docs/blind_test_log.md`](docs/blind_test_log.md)）。
+- **变异评估边界**：`scripts/mutation_eval.py` 验证的是引擎分类确定性与演示规则集的有效性，业务仓库接入时需编写覆盖其自身接口契约的验收规则。
