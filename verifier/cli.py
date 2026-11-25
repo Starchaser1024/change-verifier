@@ -18,12 +18,15 @@ import argparse
 import json
 import os
 import pathlib
+import shlex
+import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Optional, Sequence
+from typing import IO, Optional, Sequence
 
 from . import __version__, demo_data
 from .classification import CLASSIFICATION_LABELS, CLASSIFICATION_ORDER
@@ -49,17 +52,63 @@ def port_is_available(port: int) -> bool:
         s.close()
 
 
-def wait_ready(url: str, timeout: float = 20.0) -> bool:
+def allocate_free_ports(count: int = 1) -> list[int]:
+    """同时绑定 `count` 个本地回环临时端口后再统一释放，避免连续分配拿到相同端口。"""
+    sockets: list[socket.socket] = []
+    ports: list[int] = []
+    try:
+        for _ in range(count):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            ports.append(int(s.getsockname()[1]))
+            sockets.append(s)
+        return ports
+    finally:
+        for s in sockets:
+            s.close()
+
+
+def _terminate_processes(procs: Sequence[subprocess.Popen]) -> None:
+    """优雅终止子进程列表；超时未退出时强制 kill 并回收句柄。"""
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+    for p in procs:
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            try:
+                p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def wait_ready(url: str, timeout: float = 20.0, proc: Optional[subprocess.Popen] = None) -> bool:
+    """轮询就绪地址直至返回 <500；若传入 `proc` 且进程提前退出则立即返回 False。"""
     import httpx
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             if httpx.get(url, timeout=1).status_code < 500:
                 return True
         except Exception:
             pass
-        time.sleep(0.3)
+        if proc is not None and proc.poll() is not None:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.2, remaining))
     return False
 
 
@@ -82,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--baseline-port", type=int, default=None, help="baseline 端口（默认 8620）")
     p_demo.add_argument("--candidate-port", type=int, default=None, help="candidate 端口（默认 8621）")
     p_demo.add_argument("--port", type=int, default=None, help="验收器网页端口（默认 8622）")
+    p_demo.add_argument("--ready-timeout", type=float, default=20.0, help="单个服务启动就绪超时秒数（默认 20）")
 
     # ---------------- verify ----------------
     p_verify = subparsers.add_parser(
@@ -96,6 +146,53 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_verify.add_argument("--baseline", default=None, help="修改前（baseline）环境 URL，如 http://127.0.0.1:8620")
     p_verify.add_argument("--candidate", default=None, help="修改后（candidate）环境 URL，如 http://127.0.0.1:8621")
+    p_verify.add_argument(
+        "--baseline-cmd",
+        default=None,
+        help="托管启动修改前（baseline）本地服务的命令模板；支持 {port}、{host}、{env}、{temp_dir} 占位符",
+    )
+    p_verify.add_argument(
+        "--candidate-cmd",
+        default=None,
+        help="托管启动修改后（candidate）本地服务的命令模板；支持 {port}、{host}、{env}、{temp_dir} 占位符",
+    )
+    p_verify.add_argument(
+        "--baseline-cwd",
+        type=pathlib.Path,
+        default=None,
+        help="托管 baseline 服务进程的工作目录（如 git worktree 检出目录）",
+    )
+    p_verify.add_argument(
+        "--candidate-cwd",
+        type=pathlib.Path,
+        default=None,
+        help="托管 candidate 服务进程的工作目录",
+    )
+    p_verify.add_argument(
+        "--baseline-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="向托管 baseline 进程注入额外环境变量（可重复指定，支持 {port}/{host}/{env}/{temp_dir}）",
+    )
+    p_verify.add_argument(
+        "--candidate-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="向托管 candidate 进程注入额外环境变量（可重复指定，支持 {port}/{host}/{env}/{temp_dir}）",
+    )
+    p_verify.add_argument(
+        "--ready-path",
+        default="/healthz",
+        help="托管服务就绪探针路径（默认 /healthz）",
+    )
+    p_verify.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=20.0,
+        help="托管服务启动就绪超时秒数（默认 20）",
+    )
     p_verify.add_argument("--db", type=pathlib.Path, default=None, help="SQLite 数据库路径（默认读取 VERIFIER_DB）")
     p_verify.add_argument("--allow-draft", action="store_true", help="允许执行 SQLite 中尚未确认（draft）的规则版本")
     p_verify.add_argument("--allow-remote", action="store_true", help="允许访问非本机（非 127.0.0.1/localhost）目标环境")
@@ -144,7 +241,12 @@ def run_demo_stack(
     baseline_port_override: Optional[int] = None,
     candidate_port_override: Optional[int] = None,
     verifier_port_override: Optional[int] = None,
+    ready_timeout: float = 20.0,
 ) -> int:
+    if ready_timeout <= 0:
+        print("[run_demo] 参数错误：--ready-timeout 必须大于 0", file=sys.stderr)
+        return 2
+
     file_env = parse_env_file()
     if file_env:
         print(f"[run_demo] 发现 .env，包含：{', '.join(sorted(file_env))}（由各服务自行读取）")
@@ -171,6 +273,9 @@ def run_demo_stack(
         "DEMO_BASELINE_PORT": str(baseline_port),
         "DEMO_CANDIDATE_PORT": str(candidate_port),
         "VERIFIER_PORT": str(verifier_port),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
     }
 
     services = [
@@ -197,10 +302,29 @@ def run_demo_stack(
             print(f"[run_demo] 启动 {name} ...")
             p = subprocess.Popen(cmd, cwd=str(root_dir), env=child_env)
             procs.append((name, p))
-            if not wait_ready(ready_url):
-                print(f"[run_demo] 警告：{name} 在 20 秒内未就绪，请查看其日志。")
-            else:
-                print(f"[run_demo] {name} 已就绪")
+            ready = wait_ready(ready_url, timeout=ready_timeout, proc=p)
+            exit_code = p.poll()
+            if exit_code is not None:
+                print(
+                    f"[run_demo] 错误：{name} 在启动期间提前退出（代码 {exit_code}），正在终止已启动服务。",
+                    file=sys.stderr,
+                )
+                return 1
+            if not ready:
+                print(
+                    f"[run_demo] 错误：{name} 在 {ready_timeout:g} 秒内未就绪（{ready_url}），正在终止已启动服务。",
+                    file=sys.stderr,
+                )
+                return 1
+            for prev_name, prev_proc in procs[:-1]:
+                prev_code = prev_proc.poll()
+                if prev_code is not None:
+                    print(
+                        f"[run_demo] 错误：{prev_name} 在启动阶段意外退出（代码 {prev_code}），正在终止已启动服务。",
+                        file=sys.stderr,
+                    )
+                    return 1
+            print(f"[run_demo] {name} 已就绪")
         print()
         print("[run_demo] 全部服务已启动。")
         print(
@@ -219,14 +343,7 @@ def run_demo_stack(
         print("\n[run_demo] 收到 Ctrl+C，正在停止服务…")
         return 0
     finally:
-        for _, p in procs:
-            if p.poll() is None:
-                p.terminate()
-        for _, p in procs:
-            try:
-                p.wait(timeout=5)
-            except Exception:
-                p.kill()
+        _terminate_processes([p for _, p in procs])
 
 
 def _parse_fail_on(raw: str) -> set[str]:
@@ -347,6 +464,76 @@ def _write_report_file(path: pathlib.Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _split_command_template(cmd_template: str) -> list[str]:
+    cleaned = cmd_template.strip()
+    if not cleaned:
+        raise ValueError("启动命令不能为空字符串")
+    try:
+        if os.name == "nt":
+            raw_tokens = shlex.split(cleaned, posix=False)
+            tokens: list[str] = []
+            for tok in raw_tokens:
+                if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ('"', "'"):
+                    quote = tok[0]
+                    tok = tok[1:-1]
+                    if quote == '"':
+                        tok = tok.replace('\\"', '"')
+                elif "=" in tok:
+                    key, _, val = tok.partition("=")
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                        quote = val[0]
+                        val = val[1:-1]
+                        if quote == '"':
+                            val = val.replace('\\"', '"')
+                        tok = f"{key}={val}"
+                tokens.append(tok)
+        else:
+            tokens = shlex.split(cleaned, posix=True)
+    except ValueError as e:
+        raise ValueError(f"无法解析启动命令 {cmd_template!r}：{e}") from e
+    if not tokens:
+        raise ValueError("启动命令解析后为空")
+    return tokens
+
+
+def _render_cmd_placeholders(
+    text: str,
+    *,
+    port: int,
+    host: str,
+    env_label: str,
+    temp_dir: pathlib.Path,
+) -> str:
+    return (
+        text.replace("{port}", str(port))
+        .replace("{host}", host)
+        .replace("{env}", env_label)
+        .replace("{temp_dir}", str(temp_dir))
+    )
+
+
+def _parse_env_overrides(items: Sequence[str], flag_name: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for raw in items:
+        key, sep, val = raw.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"{flag_name} 格式错误 {raw!r}，应为 KEY=VALUE")
+        pairs.append((key, val))
+    return pairs
+
+
+def _read_log_tail(log_path: pathlib.Path, max_lines: int = 20) -> str:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     load_env()
     try:
@@ -357,6 +544,42 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     if args.timeout <= 0 or args.timeout > 60:
         print("[verify] 参数错误：--timeout 必须在 (0, 60] 秒之间", file=sys.stderr)
+        return 2
+
+    if args.ready_timeout <= 0 or args.ready_timeout > 300:
+        print("[verify] 参数错误：--ready-timeout 必须在 (0, 300] 秒之间", file=sys.stderr)
+        return 2
+
+    if not args.ready_path or not args.ready_path.startswith("/"):
+        print("[verify] 参数错误：--ready-path 必须以 / 开头", file=sys.stderr)
+        return 2
+
+    if args.baseline and args.baseline_cmd:
+        print("[verify] 参数错误：--baseline 与 --baseline-cmd 不能同时指定", file=sys.stderr)
+        return 2
+    if args.candidate and args.candidate_cmd:
+        print("[verify] 参数错误：--candidate 与 --candidate-cmd 不能同时指定", file=sys.stderr)
+        return 2
+
+    if (args.baseline_cwd or args.baseline_env) and not args.baseline_cmd:
+        print("[verify] 参数错误：--baseline-cwd / --baseline-env 需配合 --baseline-cmd 使用", file=sys.stderr)
+        return 2
+    if (args.candidate_cwd or args.candidate_env) and not args.candidate_cmd:
+        print("[verify] 参数错误：--candidate-cwd / --candidate-env 需配合 --candidate-cmd 使用", file=sys.stderr)
+        return 2
+
+    for label, cwd in (("baseline", args.baseline_cwd), ("candidate", args.candidate_cwd)):
+        if cwd is not None and not cwd.is_dir():
+            print(f"[verify] 参数错误：{label} 工作目录不存在：{cwd}", file=sys.stderr)
+            return 2
+
+    try:
+        baseline_tokens = _split_command_template(args.baseline_cmd) if args.baseline_cmd is not None else None
+        candidate_tokens = _split_command_template(args.candidate_cmd) if args.candidate_cmd is not None else None
+        baseline_env_pairs = _parse_env_overrides(args.baseline_env, "--baseline-env")
+        candidate_env_pairs = _parse_env_overrides(args.candidate_env, "--candidate-env")
+    except ValueError as e:
+        print(f"[verify] 参数错误：{e}", file=sys.stderr)
         return 2
 
     try:
@@ -399,10 +622,27 @@ def cmd_verify(args: argparse.Namespace) -> int:
             print(f"  - {err}", file=sys.stderr)
         return 2
 
-    raw_baseline = args.baseline or task_info.get("baseline_url")
-    raw_candidate = args.candidate or task_info.get("candidate_url")
+    need_ports = int(baseline_tokens is not None) + int(candidate_tokens is not None)
+    allocated_ports = allocate_free_ports(need_ports) if need_ports else []
+    port_iter = iter(allocated_ports)
+    baseline_port = next(port_iter) if baseline_tokens is not None else None
+    candidate_port = next(port_iter) if candidate_tokens is not None else None
+
+    raw_baseline = (
+        f"http://127.0.0.1:{baseline_port}"
+        if baseline_port is not None
+        else (args.baseline or task_info.get("baseline_url"))
+    )
+    raw_candidate = (
+        f"http://127.0.0.1:{candidate_port}"
+        if candidate_port is not None
+        else (args.candidate or task_info.get("candidate_url"))
+    )
     if not raw_baseline or not raw_candidate:
-        print("[verify] 参数错误：必须提供 --baseline 与 --candidate 目标环境地址", file=sys.stderr)
+        print(
+            "[verify] 参数错误：必须提供 --baseline（或 --baseline-cmd）与 --candidate（或 --candidate-cmd）",
+            file=sys.stderr,
+        )
         return 2
 
     allow_remote = bool(args.allow_remote or task_info.get("allow_remote"))
@@ -422,66 +662,169 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"[verify] {e}", file=sys.stderr)
         return 2
 
-    task_meta = {
-        "id": task_info.get("id", "cli"),
-        "name": args.task_name or task_info.get("name") or "CLI 无头改动验收",
-        "requirement": args.requirement if args.requirement is not None else task_info.get("requirement", ""),
-        "baseline_url": baseline_url,
-        "candidate_url": candidate_url,
-    }
+    temp_root: Optional[pathlib.Path] = None
+    managed_procs: list[subprocess.Popen] = []
+    log_handles: list[IO[str]] = []
+    launched: list[tuple[str, subprocess.Popen, str, pathlib.Path]] = []
 
-    started_at = now_iso()
-    outcome = run_checks(checks, baseline_url, candidate_url, default_timeout=args.timeout)
-    finished_at = now_iso()
-    result = outcome["payload"]
+    try:
+        if need_ports:
+            temp_root = pathlib.Path(tempfile.mkdtemp(prefix="change_verifier_"))
+            specs = []
+            if baseline_tokens is not None and baseline_port is not None:
+                specs.append(
+                    ("baseline", baseline_tokens, baseline_port, baseline_url, args.baseline_cwd, baseline_env_pairs)
+                )
+            if candidate_tokens is not None and candidate_port is not None:
+                specs.append(
+                    ("candidate", candidate_tokens, candidate_port, candidate_url, args.candidate_cwd, candidate_env_pairs)
+                )
 
-    run_meta = {
-        "id": "headless",
-        "status": outcome["status"],
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "error": None,
-    }
+            for env_label, tokens, port, base_url, target_cwd, env_pairs in specs:
+                inst_dir = temp_root / env_label
+                inst_dir.mkdir(parents=True, exist_ok=True)
+                argv = [
+                    _render_cmd_placeholders(
+                        tok, port=port, host="127.0.0.1", env_label=env_label, temp_dir=inst_dir
+                    )
+                    for tok in tokens
+                ]
+                child_env = {
+                    **os.environ,
+                    "HOST": "127.0.0.1",
+                    "PORT": str(port),
+                    "VERIFIER_TARGET_HOST": "127.0.0.1",
+                    "VERIFIER_TARGET_PORT": str(port),
+                    "VERIFIER_TARGET_ENV": env_label,
+                    "VERIFIER_TEMP_DIR": str(inst_dir),
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONUNBUFFERED": "1",
+                }
+                if env_label == "baseline":
+                    child_env["DEMO_BASELINE_PORT"] = str(port)
+                else:
+                    child_env["DEMO_CANDIDATE_PORT"] = str(port)
 
-    if args.output is not None:
-        if args.output.suffix.lower() == ".json":
+                for key, val in env_pairs:
+                    child_env[key] = _render_cmd_placeholders(
+                        val, port=port, host="127.0.0.1", env_label=env_label, temp_dir=inst_dir
+                    )
+
+                log_path = inst_dir / "service.log"
+                log_fh = log_path.open("w+", encoding="utf-8")
+                log_handles.append(log_fh)
+                try:
+                    proc = subprocess.Popen(
+                        argv,
+                        cwd=str(target_cwd) if target_cwd is not None else None,
+                        env=child_env,
+                        stdout=log_fh,
+                        stderr=subprocess.STDOUT,
+                    )
+                except OSError as e:
+                    print(f"[verify] 启动托管 {env_label} 服务失败：{e}", file=sys.stderr)
+                    return 1
+                managed_procs.append(proc)
+                launched.append((env_label, proc, f"{base_url.rstrip('/')}{args.ready_path}", log_path))
+
+            deadline = time.monotonic() + args.ready_timeout
+            for env_label, proc, ready_url, log_path in launched:
+                remaining = max(0.05, deadline - time.monotonic())
+                ready = wait_ready(ready_url, timeout=remaining, proc=proc)
+                exit_code = proc.poll()
+                if exit_code is not None or not ready:
+                    if exit_code is not None:
+                        print(
+                            f"[verify] 托管 {env_label} 服务在就绪前提前退出（退出码 {exit_code}）",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[verify] 托管 {env_label} 服务在 {args.ready_timeout:g} 秒内未就绪（{ready_url}）",
+                            file=sys.stderr,
+                        )
+                    tail = _read_log_tail(log_path)
+                    if tail:
+                        print(f"[verify] {env_label} 服务日志：\n{tail}", file=sys.stderr)
+                    return 1
+
+            if not args.quiet:
+                summary_targets = ", ".join(
+                    f"{lbl}=http://127.0.0.1:{ (baseline_port if lbl == 'baseline' else candidate_port) }"
+                    for lbl, _, _, _ in launched
+                )
+                print(f"[verify] 托管服务已就绪：{summary_targets}")
+
+        task_meta = {
+            "id": task_info.get("id", "cli"),
+            "name": args.task_name or task_info.get("name") or "CLI 无头改动验收",
+            "requirement": args.requirement if args.requirement is not None else task_info.get("requirement", ""),
+            "baseline_url": baseline_url,
+            "candidate_url": candidate_url,
+        }
+
+        started_at = now_iso()
+        outcome = run_checks(checks, baseline_url, candidate_url, default_timeout=args.timeout)
+        finished_at = now_iso()
+        result = outcome["payload"]
+
+        run_meta = {
+            "id": "headless",
+            "status": outcome["status"],
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "error": None,
+        }
+
+        if args.output is not None:
+            if args.output.suffix.lower() == ".json":
+                report_obj = build_json_report(task_meta, version_info, run_meta, result)
+                _write_report_file(args.output, json.dumps(report_obj, ensure_ascii=False, indent=2))
+            else:
+                md_text = render_markdown(task_meta, version_info, run_meta, result)
+                _write_report_file(args.output, md_text)
+
+        if args.json_output is not None:
             report_obj = build_json_report(task_meta, version_info, run_meta, result)
-            _write_report_file(args.output, json.dumps(report_obj, ensure_ascii=False, indent=2))
-        else:
-            md_text = render_markdown(task_meta, version_info, run_meta, result)
-            _write_report_file(args.output, md_text)
+            _write_report_file(args.json_output, json.dumps(report_obj, ensure_ascii=False, indent=2))
 
-    if args.json_output is not None:
-        report_obj = build_json_report(task_meta, version_info, run_meta, result)
-        _write_report_file(args.json_output, json.dumps(report_obj, ensure_ascii=False, indent=2))
+        summary = result["summary"]
+        counts = summary["counts"]
+        print(f"[verify] 结论：{summary['headline']}")
+        breakdown = " · ".join(
+            f"{CLASSIFICATION_LABELS[code]} {counts[code]}"
+            for code in CLASSIFICATION_ORDER
+            if counts.get(code)
+        )
+        if breakdown:
+            print(f"[verify] 统计（共 {summary['total_checks']} 项）：{breakdown}")
 
-    summary = result["summary"]
-    counts = summary["counts"]
-    print(f"[verify] 结论：{summary['headline']}")
-    breakdown = " · ".join(
-        f"{CLASSIFICATION_LABELS[code]} {counts[code]}"
-        for code in CLASSIFICATION_ORDER
-        if counts.get(code)
-    )
-    if breakdown:
-        print(f"[verify] 统计（共 {summary['total_checks']} 项）：{breakdown}")
+        if not args.quiet:
+            for cmp in result["checks"]:
+                cl = cmp["classification"]
+                print(f"  [{cl['label']}] {cmp['id']} — {cmp['name']}")
 
-    if not args.quiet:
-        for cmp in result["checks"]:
-            cl = cmp["classification"]
-            print(f"  [{cl['label']}] {cmp['id']} — {cmp['name']}")
+        if args.output is not None:
+            print(f"[verify] 报告已写入：{args.output}")
+        if args.json_output is not None:
+            print(f"[verify] JSON 报告已写入：{args.json_output}")
 
-    if args.output is not None:
-        print(f"[verify] 报告已写入：{args.output}")
-    if args.json_output is not None:
-        print(f"[verify] JSON 报告已写入：{args.json_output}")
-
-    triggered = [code for code in CLASSIFICATION_ORDER if code in fail_codes and counts.get(code, 0) > 0]
-    if triggered:
-        labels = "、".join(f"{CLASSIFICATION_LABELS[c]}({counts[c]})" for c in triggered)
-        print(f"[verify] 门禁未通过：命中阻断项 {labels}", file=sys.stderr)
-        return 1
-    return 0
+        triggered = [code for code in CLASSIFICATION_ORDER if code in fail_codes and counts.get(code, 0) > 0]
+        if triggered:
+            labels = "、".join(f"{CLASSIFICATION_LABELS[c]}({counts[c]})" for c in triggered)
+            print(f"[verify] 门禁未通过：命中阻断项 {labels}", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        _terminate_processes(managed_procs)
+        for fh in log_handles:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if temp_root is not None:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -499,6 +842,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             baseline_port_override=args.baseline_port,
             candidate_port_override=args.candidate_port,
             verifier_port_override=args.port,
+            ready_timeout=args.ready_timeout,
         )
     if args.command == "verify":
         return cmd_verify(args)

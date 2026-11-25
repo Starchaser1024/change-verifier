@@ -8,8 +8,10 @@ import pathlib
 import sqlite3
 import subprocess
 import sys
+import time
 
 import httpx
+import pytest
 
 from verifier import cli, demo_data
 from verifier.db import SCHEMA, now_iso
@@ -421,3 +423,468 @@ def test_modular_frontend_assets_served(verifier_client):
         assert asset in html
         res = verifier_client.get(asset)
         assert res.status_code == 200
+
+
+def test_wait_ready_fails_fast_when_process_exits(dead_url):
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(4)"])
+    try:
+        started = time.monotonic()
+        ready = cli.wait_ready(dead_url, timeout=10.0, proc=proc)
+        elapsed = time.monotonic() - started
+    finally:
+        proc.wait(timeout=5)
+    assert ready is False
+    assert elapsed < 3.0
+
+
+def test_run_demo_stack_terminates_started_procs_on_readiness_timeout(monkeypatch, capsys):
+    ports = cli.allocate_free_ports(3)
+    spawned: list = []
+
+    class FakeProc:
+        def __init__(self, cmd):
+            self.cmd = cmd
+            self.terminated = False
+            self.waited = False
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+        def kill(self):
+            self.terminated = True
+
+    def fake_popen(cmd, cwd=None, env=None):
+        p = FakeProc(cmd)
+        spawned.append(p)
+        return p
+
+    ready_calls: list[str] = []
+
+    def fake_wait_ready(url, timeout=20.0, proc=None):
+        ready_calls.append(url)
+        # 第一个服务（baseline）就绪，第二个服务（candidate）超时未就绪
+        return len(ready_calls) == 1
+
+    monkeypatch.setattr(cli, "port_is_available", lambda port: True)
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "wait_ready", fake_wait_ready)
+
+    code = cli.run_demo_stack(
+        baseline_port_override=ports[0],
+        candidate_port_override=ports[1],
+        verifier_port_override=ports[2],
+        ready_timeout=0.5,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert len(spawned) == 2, "第二个服务未就绪时应立即中止，不再拉起第三个服务"
+    assert all(p.terminated and p.waited for p in spawned), "已拉起的子进程必须在退出前被终止回收"
+    assert "全部服务已启动" not in captured.out
+    assert "未就绪" in captured.err
+
+
+def test_run_demo_stack_fails_fast_when_child_exits_prematurely(monkeypatch, capsys):
+    ports = cli.allocate_free_ports(3)
+    spawned: list = []
+
+    class FakeProc:
+        def __init__(self, idx: int):
+            self.idx = idx
+            self.terminated = False
+            self.waited = False
+
+        def poll(self):
+            if self.idx == 1:
+                return 3  # candidate 启动阶段立即崩溃退出
+            return 0 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+        def kill(self):
+            self.terminated = True
+
+    def fake_popen(cmd, cwd=None, env=None):
+        p = FakeProc(len(spawned))
+        spawned.append(p)
+        return p
+
+    monkeypatch.setattr(cli, "port_is_available", lambda port: True)
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "wait_ready", lambda url, timeout=20.0, proc=None: proc.poll() is None)
+
+    code = cli.run_demo_stack(
+        baseline_port_override=ports[0],
+        candidate_port_override=ports[1],
+        verifier_port_override=ports[2],
+        ready_timeout=1.0,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert len(spawned) == 2
+    assert spawned[0].terminated and spawned[0].waited
+    assert "全部服务已启动" not in captured.out
+    assert "提前退出" in captured.err
+
+
+def test_split_command_template_handles_windows_and_posix_paths(monkeypatch):
+    monkeypatch.setattr(cli.os, "name", "nt")
+    win_tokens = cli._split_command_template(
+        r'"C:\Program Files\Python313\python.exe" -m uvicorn app:app --port {port} --db="{temp_dir}\state.db"'
+    )
+    assert win_tokens == [
+        r"C:\Program Files\Python313\python.exe",
+        "-m",
+        "uvicorn",
+        "app:app",
+        "--port",
+        "{port}",
+        r"--db={temp_dir}\state.db",
+    ]
+
+    monkeypatch.setattr(cli.os, "name", "posix")
+    posix_tokens = cli._split_command_template(
+        "'/opt/py venv/bin/python' -m uvicorn app:app --port {port} --db '{temp_dir}/state.db'"
+    )
+    assert posix_tokens == [
+        "/opt/py venv/bin/python",
+        "-m",
+        "uvicorn",
+        "app:app",
+        "--port",
+        "{port}",
+        "--db",
+        "{temp_dir}/state.db",
+    ]
+
+
+def test_verify_managed_dual_commands_placeholders_and_cleanup(tmp_path):
+    """验证 --baseline-cmd / --candidate-cmd 自动分配端口、注入占位符与环境变量并在结束后清理进程。"""
+    server_script = tmp_path / "mini_service.py"
+    server_script.write_text(
+        """
+import json
+import os
+import pathlib
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+port = int(sys.argv[1])
+role = sys.argv[2]
+state_dir = pathlib.Path(sys.argv[3])
+marker = state_dir / "boot.txt"
+marker.write_text(role, encoding="utf-8")
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        if self.path == "/readyz":
+            body = {"ok": True}
+            code = 200
+        elif self.path == "/api/info":
+            body = {
+                "role": os.environ.get("VERIFIER_TARGET_ENV"),
+                "arg_role": role,
+                "custom_tag": os.environ.get("SERVICE_TAG"),
+                "state_exists": marker.is_file(),
+                "cwd_name": pathlib.Path.cwd().name,
+                "schema_v": 2 if os.environ.get("CANDIDATE_V2") == "1" else 1,
+            }
+            code = 200
+        else:
+            body = {"detail": "not found"}
+            code = 404
+        raw = json.dumps(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+""".strip(),
+        encoding="utf-8",
+    )
+
+    base_cwd = tmp_path / "worktree_base"
+    cand_cwd = tmp_path / "worktree_cand"
+    base_cwd.mkdir()
+    cand_cwd.mkdir()
+
+    rules_file = tmp_path / "managed_rules.json"
+    rules_file.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "isolated-state-check",
+                    "name": "双实例隔离目录与工作目录生效",
+                    "category": "existing_behavior",
+                    "steps": [
+                        {
+                            "method": "GET",
+                            "path": "/api/info",
+                            "assert": [
+                                {"type": "status", "op": "equals", "value": 200},
+                                {"type": "json", "path": "$.state_exists", "op": "equals", "value": True},
+                                {"type": "json", "path": "$.role", "op": "in", "value": ["baseline", "candidate"]},
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": "schema-v2-upgrade",
+                    "name": "新版本返回 schema_v=2",
+                    "category": "new_requirement",
+                    "steps": [
+                        {
+                            "method": "GET",
+                            "path": "/api/info",
+                            "assert": [
+                                {"type": "status", "op": "equals", "value": 200},
+                                {"type": "json", "path": "$.schema_v", "op": "equals", "value": 2},
+                                {"type": "json", "path": "$.cwd_name", "op": "equals", "value": "worktree_cand"},
+                            ],
+                        }
+                    ],
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    json_report_path = tmp_path / "managed_report.json"
+    cmd_tpl = f'"{sys.executable}" "{server_script}" {{port}} {{env}} "{{temp_dir}}"'
+
+    code = cli.main(
+        [
+            "verify",
+            "--rules",
+            str(rules_file),
+            "--baseline-cmd",
+            cmd_tpl,
+            "--baseline-cwd",
+            str(base_cwd),
+            "--baseline-env",
+            "SERVICE_TAG={env}-{port}",
+            "--candidate-cmd",
+            cmd_tpl,
+            "--candidate-cwd",
+            str(cand_cwd),
+            "--candidate-env",
+            "CANDIDATE_V2=1",
+            "--ready-path",
+            "/readyz",
+            "--ready-timeout",
+            "15",
+            "--json-output",
+            str(json_report_path),
+            "--quiet",
+        ]
+    )
+
+    assert code == 0
+    report = json.loads(json_report_path.read_text(encoding="utf-8"))
+    assert report["summary"]["counts"] == {"pass": 1, "satisfied": 1}
+
+    # 确认托管子进程已被 finally 终止，不再监听对应回环地址
+    for key in ("baseline_url", "candidate_url"):
+        url = report["task"][key]
+        with pytest.raises(httpx.ConnectError):
+            httpx.get(f"{url}/readyz", timeout=1.0)
+
+
+def test_verify_managed_demo_services_gate_pass_and_regression(tmp_path):
+    base_cmd = f'"{sys.executable}" -m demo.run_baseline'
+    cand_cmd = f'"{sys.executable}" -m demo.run_candidate'
+    out_json = tmp_path / "demo_managed.json"
+
+    assert (
+        cli.main(
+            [
+                "verify",
+                "--demo-rules",
+                "--baseline-cmd",
+                base_cmd,
+                "--baseline-cwd",
+                str(ROOT),
+                "--candidate-cmd",
+                cand_cmd,
+                "--candidate-cwd",
+                str(ROOT),
+                "--candidate-env",
+                "DEMO_DEFECTS=none",
+                "--json-output",
+                str(out_json),
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+    counts = json.loads(out_json.read_text(encoding="utf-8"))["summary"]["counts"]
+    assert counts.get("regression", 0) == 0
+    assert counts.get("not_met", 0) == 0
+
+    # 开启缺陷 A 时门禁必须返回 1
+    assert (
+        cli.main(
+            [
+                "verify",
+                "--demo-rules",
+                "--baseline-cmd",
+                base_cmd,
+                "--baseline-cwd",
+                str(ROOT),
+                "--candidate-cmd",
+                cand_cmd,
+                "--candidate-cwd",
+                str(ROOT),
+                "--candidate-env",
+                "DEMO_DEFECTS=A",
+                "--quiet",
+            ]
+        )
+        == 1
+    )
+
+
+def test_verify_managed_command_early_exit_and_timeout_cleanup(tmp_path, capsys):
+    rules_path = tmp_path / "ping.json"
+    rules_path.write_text(json.dumps([PING_CHECK]), encoding="utf-8")
+
+    # 1) candidate 启动阶段崩溃退出：应快速失败返回 1，并终止已启动的 baseline 服务
+    base_cmd = f'"{sys.executable}" -m demo.run_baseline'
+    crash_cmd = f'"{sys.executable}" -c "import sys; sys.stderr.write(\'boom\\n\'); sys.exit(5)"'
+    code_crash = cli.main(
+        [
+            "verify",
+            "--rules",
+            str(rules_path),
+            "--baseline-cmd",
+            base_cmd,
+            "--baseline-cwd",
+            str(ROOT),
+            "--candidate-cmd",
+            crash_cmd,
+            "--ready-timeout",
+            "10",
+            "--quiet",
+        ]
+    )
+    err_crash = capsys.readouterr().err
+    assert code_crash == 1
+    assert "提前退出" in err_crash
+    assert "boom" in err_crash
+
+    # 2) 服务挂起不监听端口：超过 ready-timeout 返回 1 并清理子进程
+    sleep_cmd = f'"{sys.executable}" -c "import time; time.sleep(30)"'
+    started = time.monotonic()
+    code_timeout = cli.main(
+        [
+            "verify",
+            "--rules",
+            str(rules_path),
+            "--baseline-cmd",
+            sleep_cmd,
+            "--candidate-cmd",
+            sleep_cmd,
+            "--ready-timeout",
+            "0.6",
+            "--quiet",
+        ]
+    )
+    elapsed = time.monotonic() - started
+    err_timeout = capsys.readouterr().err
+    assert code_timeout == 1
+    assert elapsed < 8.0
+    assert "未就绪" in err_timeout
+
+
+def test_verify_managed_command_rejects_conflicting_or_malformed_flags(tmp_path):
+    rules_path = tmp_path / "ping.json"
+    rules_path.write_text(json.dumps([PING_CHECK]), encoding="utf-8")
+    noop_cmd = f'"{sys.executable}" -m demo.run_baseline'
+
+    # --baseline 与 --baseline-cmd 冲突 -> 2
+    assert (
+        cli.main(
+            [
+                "verify",
+                "--rules",
+                str(rules_path),
+                "--baseline",
+                "http://127.0.0.1:8620",
+                "--baseline-cmd",
+                noop_cmd,
+                "--candidate",
+                "http://127.0.0.1:8621",
+            ]
+        )
+        == 2
+    )
+    # 缺少 = 的环境变量覆盖 -> 2
+    assert (
+        cli.main(
+            [
+                "verify",
+                "--rules",
+                str(rules_path),
+                "--baseline-cmd",
+                noop_cmd,
+                "--baseline-env",
+                "INVALID_ENV_PAIR",
+                "--candidate",
+                "http://127.0.0.1:8621",
+            ]
+        )
+        == 2
+    )
+    # --ready-path 未以 / 开头 -> 2
+    assert (
+        cli.main(
+            [
+                "verify",
+                "--rules",
+                str(rules_path),
+                "--baseline-cmd",
+                noop_cmd,
+                "--candidate",
+                "http://127.0.0.1:8621",
+                "--ready-path",
+                "healthz",
+            ]
+        )
+        == 2
+    )
+    # --baseline-cwd 未配合 --baseline-cmd -> 2
+    assert (
+        cli.main(
+            [
+                "verify",
+                "--rules",
+                str(rules_path),
+                "--baseline",
+                "http://127.0.0.1:8620",
+                "--baseline-cwd",
+                str(tmp_path),
+                "--candidate",
+                "http://127.0.0.1:8621",
+            ]
+        )
+        == 2
+    )
