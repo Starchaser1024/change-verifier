@@ -114,7 +114,7 @@ change-verifier/
 │   ├── ARCHITECTURE.md         # 架构设计、8 类判定状态机与威胁模型详解
 │   ├── sample_report.md        # 真实运行导出的脱敏验收报告样例
 │   └── mutation_eval_results.md# 变异评估实测矩阵（90 次判定 0 误报 / 0 漏报）
-└── tests/                      # 101 个自动化单元与端到端集成测试
+└── tests/                      # 117 个自动化单元与端到端集成测试
 ```
 
 ---
@@ -123,14 +123,26 @@ change-verifier/
 
 需要 Python 3.10+：
 
+**Linux / macOS (Bash)**：
+
+```bash
+git clone https://github.com/Starchaser1024/change-verifier.git
+cd change-verifier
+
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
+# （可选）配置模型 Key：复制模板后填入 LLM_API_KEY 或 OPENAI_API_KEY
+cp .env.example .env
+```
+
+**Windows (PowerShell)**：
+
 ```powershell
 git clone https://github.com/Starchaser1024/change-verifier.git
 cd change-verifier
 
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-# 若仅安装列表依赖也可执行：.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
 # （可选）配置模型 Key：复制模板后编辑 .env 填入 LLM_API_KEY 或 OPENAI_API_KEY
 Copy-Item .env.example .env
 ```
@@ -161,48 +173,84 @@ change-verifier serve            # 验收器网页 (8622，兼容无参数 `pyth
 
 ### 方式二：无头 CLI 与 CI/CD 流水线门禁（Headless Mode）
 
-除了浏览器界面，`change-verifier verify` 支持直接从 JSON 规则文件或 SQLite 已确认规则版本执行无头验收，零回归返回退出码 `0`，发现回归返回非零退出码 `1`，可直接嵌入 GitHub Actions / GitLab CI：
+除了浏览器界面，`change-verifier verify` 支持从 JSON 规则文件或 SQLite 已确认规则版本执行无头验收；既可连接已运行的目标 URL，也可通过 `--baseline-cmd` / `--candidate-cmd` **自动分配回环端口、拉起双版本子进程、轮询就绪探针并在验收结束后回收进程**：
 
-```powershell
-# 1. 使用 JSON 规则文件验收并导出脱敏 Markdown 与 JSON 报告
-change-verifier verify `
-  --rules rules.json `
-  --baseline http://127.0.0.1:8620 `
-  --candidate http://127.0.0.1:8621 `
-  --output acceptance-report.md `
+**Bash（Linux / macOS / CI）**：
+
+```bash
+# 1. 托管双进程模式：自动分配空闲端口、隔离临时状态目录并在 finally 中清理进程
+change-verifier verify \
+  --demo-rules \
+  --baseline-cmd "python -m demo.run_baseline" \
+  --candidate-cmd "python -m demo.run_candidate" \
+  --candidate-env DEMO_DEFECTS=none \
+  --ready-path /healthz \
+  --ready-timeout 20 \
+  --output acceptance-report.md \
   --json-output acceptance-report.json
 
-# 2. 使用内置演示规则快速验证（或从 SQLite 指定已确认任务 `--task-id 1`）
-python -m verifier verify `
-  --demo-rules `
-  --baseline http://127.0.0.1:8620 `
-  --candidate http://127.0.0.1:8621 `
-  --output report.md
+# 2. 结合 git worktree 对比 PR 基线分支与当前分支（支持 {port}/{host}/{env}/{temp_dir} 占位符）
+git worktree add ../baseline-wt origin/main
+change-verifier verify \
+  --rules .ci/acceptance_rules.json \
+  --baseline-cwd ../baseline-wt \
+  --baseline-cmd "uvicorn app.main:app --host 127.0.0.1 --port {port}" \
+  --baseline-env "DATABASE_URL=sqlite:///{temp_dir}/app.db" \
+  --candidate-cwd . \
+  --candidate-cmd "uvicorn app.main:app --host 127.0.0.1 --port {port}" \
+  --candidate-env "DATABASE_URL=sqlite:///{temp_dir}/app.db" \
+  --ready-path /healthz \
+  --output acceptance-report.md \
+  --json-output acceptance-report.json
 
-# 3. 渐进交付模式：仅当出现「本次引入的回归」时阻断流水线
-change-verifier verify `
-  --rules rules.json `
-  --baseline http://127.0.0.1:8620 `
-  --candidate http://127.0.0.1:8621 `
+# 3. 连接已运行服务 + 渐进交付模式（仅拦截本次引入的回归）
+change-verifier verify \
+  --rules rules.json \
+  --baseline http://127.0.0.1:8620 \
+  --candidate http://127.0.0.1:8621 \
   --fail-on regression
+```
+
+**PowerShell（Windows）**：
+
+```powershell
+change-verifier verify `
+  --demo-rules `
+  --baseline-cmd "python -m demo.run_baseline" `
+  --candidate-cmd "python -m demo.run_candidate" `
+  --candidate-env DEMO_DEFECTS=none `
+  --output acceptance-report.md `
+  --json-output acceptance-report.json
 ```
 
 **退出码契约**：
 - `0`：验收通过（无 `--fail-on` 中指定的阻断分类；`PRE_EXISTING_FAILURE` 与 `EXPECTED_BEHAVIOR_CHANGE` 均正常放行）。
-- `1`：发现回归或未满足门禁条件（默认阻断 `regression,not_met,unverifiable`）。
-- `2`：规则 JSON 校验不通过、尝试执行未确认（`draft`）草稿规则，或触发非本地环境安全限制。
+- `1`：发现回归、未满足门禁条件（默认阻断 `regression,not_met,unverifiable`），或托管子进程启动失败 / 就绪超时。
+- `2`：规则 JSON 校验不通过、尝试执行未确认（`draft`）草稿规则，或触发参数 / 非本地环境安全限制。
 
-**GitHub Actions 集成示例**：
+**GitHub Actions 门禁与报告构件示例**（完整配置见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：
 
 ```yaml
 - name: Run Change Acceptance Gate
   run: |
-    python -m verifier verify \
+    change-verifier verify \
       --rules .ci/acceptance_rules.json \
-      --baseline http://127.0.0.1:8620 \
-      --candidate http://127.0.0.1:8621 \
-      --output "$GITHUB_STEP_SUMMARY" \
+      --baseline-cmd "uvicorn app.main:app --host 127.0.0.1 --port {port}" \
+      --baseline-cwd ../baseline-wt \
+      --candidate-cmd "uvicorn app.main:app --host 127.0.0.1 --port {port}" \
+      --output acceptance-report.md \
       --json-output acceptance-report.json
+    cat acceptance-report.md >> "$GITHUB_STEP_SUMMARY"
+
+- name: Upload Acceptance Reports
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: acceptance-reports
+    path: |
+      acceptance-report.md
+      acceptance-report.json
+    retention-days: 14
 ```
 
 ---
@@ -228,12 +276,13 @@ python scripts/mutation_eval.py --md docs/mutation_eval_results.md
 python -m pytest -q
 ```
 
-测试套件在随机端口拉起真实的 `baseline` / `candidate` 服务进行端到端验证（共 **12 个测试模块、101 个测试用例**）：
+测试套件在随机端口拉起真实的 `baseline` / `candidate` 服务进行端到端验证（共 **13 个测试模块、117 个测试用例**）：
 
 | 测试文件 | 覆盖重点 |
 | --- | --- |
+| `tests/test_fastapi_contract_scenarios.py` | 多场景 FastAPI 契约演进与回归隔离（列表分页上限与规则 `v1->v2` 精度对比、多仓库越权隔离、`{{nonce}}` SHA-256 幂等去重、`expected_change_ref` 评审字段升级、草稿确认门禁、`report_version=1` JSON 脱敏契约） |
 | `tests/test_e2e_demo.py` | 真实双服务 + 验收器端到端矩阵（4 回归 / 1 未满足 / 1 原有问题 / 1 行为变化 / 1 满足 / 2 通过）、脱敏验证、不可达环境全量判 `unverifiable` |
-| `tests/test_cli.py` | 无头 CLI（JSON 规则 / SQLite 确认版本强制拦截草稿 / URL 覆盖 / 退出码 `0`·`1`·`2` / `--fail-on` / 远程安全限制 / 子进程调用 / 模块化前端静态资源） |
+| `tests/test_cli.py` | 无头 CLI 与托管双进程编排（`--baseline-cmd`/`--candidate-cmd` 端口分配与清理、启动崩溃/就绪超时快速失败、SQLite 确认版本强制拦截草稿、退出码 `0`·`1`·`2`、`--fail-on`、远程安全限制） |
 | `tests/test_executor.py` | 登录提取 Token 传递、500 归为真实响应而非 `unverifiable`、超时/断连/取消隔离、占位符原始类型保持、`length_*` 集合长度算子 |
 | `tests/test_classification.py` | 8 类结论映射、摘要结论优先级、`expected_change_ref` 防洗白校验 |
 | `tests/test_redaction_and_validation.py` | 三层脱敏（请求头 / 嵌套敏感键 / 动态提取凭据字面替换）与规则结构校验 |
