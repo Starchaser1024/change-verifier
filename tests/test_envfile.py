@@ -132,6 +132,7 @@ def test_importing_app_loads_dotenv(tmp_path):
         **os.environ,
         "VERIFIER_ENV_FILE": str(env_file),
         "VERIFIER_DB": str(tmp_path / "verifier.db"),
+        "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
     }
     for name in KEY_VARS + ("LLM_BASE_URL", "LLM_MODEL"):
@@ -144,7 +145,14 @@ def test_importing_app_loads_dotenv(tmp_path):
         "print(json.dumps(llm_status(), ensure_ascii=True))"
     )
     proc = subprocess.run(
-        [sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True, env=env, timeout=120
+        [sys.executable, "-c", code],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=120,
     )
 
     assert proc.returncode == 0, f"子进程失败：{proc.stderr}"

@@ -387,7 +387,7 @@ def test_subprocess_module_cli_exit_code(tmp_path, baseline_server):
     rules_path.write_text(json.dumps([PING_CHECK]), encoding="utf-8")
     out_json = tmp_path / "out.json"
 
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.run(
         [
             sys.executable,
@@ -407,6 +407,8 @@ def test_subprocess_module_cli_exit_code(tmp_path, baseline_server):
         cwd=str(ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=60,
     )
@@ -702,11 +704,11 @@ HTTPServer(("127.0.0.1", port), Handler).serve_forever()
     report = json.loads(json_report_path.read_text(encoding="utf-8"))
     assert report["summary"]["counts"] == {"pass": 1, "satisfied": 1}
 
-    # 确认托管子进程已被 finally 终止，不再监听对应回环地址
+    # 确认托管子进程已被 finally 终止，不再监听对应回环地址（Windows 回环关闭端口可能先触发 SYN 超时）
     for key in ("baseline_url", "candidate_url"):
         url = report["task"][key]
-        with pytest.raises(httpx.ConnectError):
-            httpx.get(f"{url}/readyz", timeout=1.0)
+        with pytest.raises((httpx.ConnectError, httpx.ConnectTimeout)):
+            httpx.get(f"{url}/readyz", timeout=0.5)
 
 
 def test_verify_managed_demo_services_gate_pass_and_regression(tmp_path):
