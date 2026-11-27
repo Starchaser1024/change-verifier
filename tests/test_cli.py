@@ -890,3 +890,38 @@ def test_verify_managed_command_rejects_conflicting_or_malformed_flags(tmp_path)
         )
         == 2
     )
+
+
+def test_process_manager_module_exports_and_context_cleanup(tmp_path):
+    from verifier.process_manager import (
+        ManagedService,
+        ManagedServiceSpec,
+        allocate_free_ports,
+        managed_dual_services,
+        split_command_template,
+    )
+
+    assert cli.allocate_free_ports is allocate_free_ports
+    assert cli.ManagedService is ManagedService
+    assert cli.managed_dual_services is managed_dual_services
+
+    port = allocate_free_ports(1)[0]
+    tokens = split_command_template(f'"{sys.executable}" -m demo.run_baseline')
+    spec = ManagedServiceSpec(
+        env_label="baseline",
+        tokens=tokens,
+        port=port,
+        base_url=f"http://127.0.0.1:{port}",
+        cwd=ROOT,
+    )
+    with managed_dual_services([spec], ready_path="/healthz", ready_timeout=15.0) as services:
+        assert len(services) == 1
+        svc = services[0]
+        assert isinstance(svc, ManagedService)
+        assert httpx.get(f"{svc.base_url}/healthz", timeout=2.0).status_code == 200
+        temp_dir = svc.temp_dir
+        assert temp_dir.is_dir()
+
+    assert not temp_dir.exists()
+    with pytest.raises((httpx.ConnectError, httpx.ConnectTimeout)):
+        httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=0.5)

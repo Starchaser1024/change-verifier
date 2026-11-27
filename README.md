@@ -87,16 +87,17 @@ change-verifier/
 ├── run_demo.py                 # 一键启动本地三服务演示栈（等价于 `change-verifier demo`）
 ├── verifier/                   # 验收器核心包
 │   ├── cli.py                  # 命令行入口：serve / demo / verify（无头 CI 门禁）
+│   ├── process_manager.py      # 托管双进程编排：端口预留、跨平台命令拆分、就绪探针与生命周期清理
 │   ├── main.py                 # FastAPI 应用工厂与静态资源挂载
 │   ├── routes/                 # 模块化 HTTP 路由层（tasks / rules / runs / deps）
 │   ├── models.py               # 规则 DSL 结构、ASSERT_TYPES 白名单与完整性校验
 │   ├── schemas.py              # HTTP API 请求 Pydantic 模型
-│   ├── safety.py               # 目标 URL 校验与本地回环 / 远程写入安全守卫
-│   ├── executor.py             # 多步 HTTP 执行器（变量提取、类型保持、断言、异常隔离）
-│   ├── redaction.py            # 三层敏感凭据脱敏引擎
+│   ├── safety.py               # 目标 URL / OpenAPI 重定向与渲染路径逃逸安全守卫
+│   ├── executor.py             # 多步 HTTP 执行器（params / JSON / OAuth2 form、变量提取、断言、异常隔离）
+│   ├── redaction.py            # 敏感凭据脱敏引擎（请求头 / JSON & 表单键 / URL 查询串 / 动态机密值）
 │   ├── jsonpath.py             # JSON 路径解析与 MISSING 哨兵
 │   ├── classification.py       # 8 类确定性结果分类器与结论摘要生成
-│   ├── runner.py               # 双环境同构编排（支持无头内存执行与 SQLite 实时进度持久化）
+│   ├── runner.py               # 双环境并发同构编排（支持无头内存执行与 SQLite 实时进度持久化）
 │   ├── report.py               # Markdown 与结构化 JSON 脱敏报告渲染
 │   ├── db.py                   # SQLite 存储（任务 / 不可变规则版本 / 运行记录）
 │   ├── llm.py                  # 可选 LLM 规则建议（同源算子白名单 + 无 Key 明确降级）
@@ -114,7 +115,7 @@ change-verifier/
 │   ├── ARCHITECTURE.md         # 架构设计、8 类判定状态机与威胁模型详解
 │   ├── sample_report.md        # 真实运行导出的脱敏验收报告样例
 │   └── mutation_eval_results.md# 变异评估实测矩阵（90 次判定 0 误报 / 0 漏报）
-└── tests/                      # 117 个自动化单元与端到端集成测试
+└── tests/                      # 146 个自动化单元与端到端集成测试
 ```
 
 ---
@@ -276,7 +277,7 @@ python scripts/mutation_eval.py --md docs/mutation_eval_results.md
 python -m pytest -q
 ```
 
-测试套件在随机端口拉起真实的 `baseline` / `candidate` 服务进行端到端验证（共 **13 个测试模块、117 个测试用例**）：
+测试套件在随机端口拉起真实的 `baseline` / `candidate` 服务进行端到端验证（共 **13 个测试模块、146 个测试用例**）：
 
 | 测试文件 | 覆盖重点 |
 | --- | --- |
@@ -325,6 +326,7 @@ python -m pytest -q
 }
 ```
 
+- **请求参数与表单支持**：步骤除 `headers` 与 `json` 外，还支持结构化查询参数 `params`（如分页/过滤参数，自动对敏感键名与动态凭据脱敏）以及 `form`（以 `application/x-www-form-urlencoded` 发送表单请求体，适配 FastAPI `OAuth2PasswordRequestForm` `/token` 登录等场景，与 `json` 互斥）。
 - **内置与提取变量**：支持 `{{nonce}}`（每次运行唯一，隔离写入数据）、`{{check_id}}`、`{{env}}` 及前置步骤 `extract` 的变量；若整个字符串恰为单个占位符（如 `"{{first_order_id}}"`），自动保持原始数字/布尔类型。
 - **断言算子（`ASSERT_TYPES`）**：
   - `status`: `equals`, `in`

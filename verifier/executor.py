@@ -9,10 +9,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json as jsonlib
 import re
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -533,7 +534,12 @@ def execute_check_against_envs(
     default_timeout: float = DEFAULT_TIMEOUT_S,
     cancel_event=None,
 ) -> tuple[dict, dict]:
-    """同一检查在两个环境上分别执行，使用相同的 nonce 保证测试数据一致。"""
-    b = execute_check(check, "baseline", baseline_url, run_nonce, check_index, default_timeout, cancel_event)
-    c = execute_check(check, "candidate", candidate_url, run_nonce, check_index, default_timeout, cancel_event)
-    return b, c
+    """同一检查在两个环境上并发执行，使用相同的 nonce 保证测试数据一致。"""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_b = pool.submit(
+            execute_check, check, "baseline", baseline_url, run_nonce, check_index, default_timeout, cancel_event
+        )
+        fut_c = pool.submit(
+            execute_check, check, "candidate", candidate_url, run_nonce, check_index, default_timeout, cancel_event
+        )
+        return fut_b.result(), fut_c.result()

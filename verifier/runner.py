@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import secrets
@@ -67,18 +68,35 @@ def run_checks(
     run_nonce = secrets.token_hex(4)
     env_results: list[tuple[dict, dict, dict]] = []
 
-    for index, check in enumerate(checks):
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        baseline = execute_check(
-            check, "baseline", baseline_url, run_nonce, index, default_timeout=default_timeout, cancel_event=cancel_event
-        )
-        candidate = execute_check(
-            check, "candidate", candidate_url, run_nonce, index, default_timeout=default_timeout, cancel_event=cancel_event
-        )
-        env_results.append((check, baseline, candidate))
-        if on_progress is not None:
-            on_progress(env_results, run_nonce)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for index, check in enumerate(checks):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            fut_baseline = pool.submit(
+                execute_check,
+                check,
+                "baseline",
+                baseline_url,
+                run_nonce,
+                index,
+                default_timeout=default_timeout,
+                cancel_event=cancel_event,
+            )
+            fut_candidate = pool.submit(
+                execute_check,
+                check,
+                "candidate",
+                candidate_url,
+                run_nonce,
+                index,
+                default_timeout=default_timeout,
+                cancel_event=cancel_event,
+            )
+            baseline = fut_baseline.result()
+            candidate = fut_candidate.result()
+            env_results.append((check, baseline, candidate))
+            if on_progress is not None:
+                on_progress(env_results, run_nonce)
 
     cancelled = cancel_event is not None and cancel_event.is_set()
     final_status = "cancelled" if cancelled else "completed"
