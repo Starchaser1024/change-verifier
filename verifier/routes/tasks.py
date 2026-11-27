@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from .. import demo_data
 from ..db import get_db, now_iso, rows_to_dicts
 from ..openapi_import import extract_endpoints, fetch_spec
-from ..safety import HTTP_METHODS
+from ..safety import HTTP_METHODS, SafetyError
 from ..schemas import EndpointIn, OpenApiImportIn, TaskIn, TaskPatch
 from .deps import create_task_row, get_task_or_404, save_version_row, validate_http_url
 
@@ -130,8 +130,8 @@ def api_add_endpoint(task_id: int, payload: EndpointIn):
     method = payload.method.upper().strip()
     if method not in HTTP_METHODS:
         raise HTTPException(status_code=400, detail=f"不支持的 HTTP 方法: {payload.method}")
-    if not payload.path.startswith("/"):
-        raise HTTPException(status_code=400, detail="路径必须以 / 开头")
+    if not payload.path.startswith("/") or payload.path.startswith("//"):
+        raise HTTPException(status_code=400, detail="路径必须以单个 / 开头")
     with get_db() as conn:
         task = get_task_or_404(conn, task_id)
         endpoints = task["endpoints"]
@@ -145,12 +145,15 @@ def api_add_endpoint(task_id: int, payload: EndpointIn):
 
 @router.post("/api/tasks/{task_id}/endpoints/import")
 def api_import_openapi(task_id: int, payload: OpenApiImportIn):
+    with get_db() as conn:
+        task = get_task_or_404(conn, task_id)
     if payload.spec is None and not payload.spec_url:
         raise HTTPException(status_code=400, detail="请提供 spec_url 或直接粘贴 OpenAPI JSON（spec 字段）")
+    allow_remote = bool(task.get("allow_remote"))
     try:
-        spec = payload.spec if payload.spec is not None else fetch_spec(payload.spec_url)
+        spec = payload.spec if payload.spec is not None else fetch_spec(payload.spec_url, allow_remote=allow_remote)
         endpoints = extract_endpoints(spec)
-    except ValueError as e:
+    except (SafetyError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"导入 OpenAPI 失败：{type(e).__name__}: {e}") from e

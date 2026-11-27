@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import ipaddress
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
@@ -17,11 +18,17 @@ class SafetyError(ValueError):
     """目标地址不合法或违反本地/远程安全限制。"""
 
 
+def _has_unsafe_url_chars(value: str) -> bool:
+    return any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
 def validate_target_url(url: str, label: str) -> str:
     """校验并返回去掉末尾斜杠的 http(s) URL；非法时抛出 SafetyError。"""
     if not isinstance(url, str) or not url.strip():
         raise SafetyError(f"{label}地址不能为空")
     cleaned = url.strip()
+    if _has_unsafe_url_chars(cleaned):
+        raise SafetyError(f"{label}地址包含非法空白或控制字符：{url!r}")
     parsed = urlparse(cleaned)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise SafetyError(f"{label}地址必须是合法的 http(s) URL：{url!r}")
@@ -33,7 +40,44 @@ def is_loopback(host: Optional[str]) -> bool:
     if not host:
         return False
     normalized = host.lower().strip("[]")
-    return normalized in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or normalized.startswith("127.")
+    if normalized in ("localhost", "0.0.0.0"):
+        return True
+    try:
+        addr = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return bool(mapped is not None and mapped.is_loopback)
+
+
+def check_spec_url_safety(url: str, *, allow_remote: bool = False, label: str = "OpenAPI") -> str:
+    """校验 OpenAPI 导入或重定向目标 URL 的协议与本地回环限制。"""
+    validate_target_url(url, label)
+    cleaned = url.strip()
+    host = urlparse(cleaned).hostname
+    if not is_loopback(host) and not allow_remote:
+        raise SafetyError(
+            f"安全限制：{label}地址({host}) 不是本地地址。默认只允许从本地（127.0.0.1/localhost）环境导入，"
+            "避免服务端请求伪造（SSRF）。如确需访问远程环境，请在任务设置中显式开启「允许远程环境」。"
+        )
+    return cleaned
+
+
+def validate_rendered_path(path: Any) -> str:
+    """校验模板渲染后的请求路径，防止协议相对路径（//）或完整 URL 逃逸 base_url。"""
+    if not isinstance(path, str) or not path:
+        raise SafetyError(f"请求路径必须是非空字符串（当前: {path!r}）")
+    if not path.startswith("/"):
+        raise SafetyError(f"请求路径必须以 / 开头（当前: {path!r}）")
+    if path.startswith(("//", "/\\")):
+        raise SafetyError(f"请求路径不能以 // 或 /\\ 开头，禁止逃逸目标环境（当前: {path!r}）")
+    if "://" in path:
+        raise SafetyError(f"请求路径不能包含协议前缀 ://（当前: {path!r}）")
+    if _has_unsafe_url_chars(path):
+        raise SafetyError(f"请求路径不能包含空白或控制字符（当前: {path!r}）")
+    return path
 
 
 def check_run_safety(

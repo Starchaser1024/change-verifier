@@ -19,6 +19,7 @@ import httpx
 
 from .jsonpath import MISSING, get_path
 from .redaction import REDACTED, is_sensitive_name, mask_text, redact_headers, redact_obj
+from .safety import SafetyError, validate_rendered_path
 
 DEFAULT_TIMEOUT_S = 5.0
 MAX_TEXT_STORE = 6000
@@ -30,12 +31,13 @@ PASSED = "passed"
 FAILED = "failed"
 UNVERIFIABLE = "unverifiable"
 
-# 网络层错误类型 -> 中文说明
+# 步骤错误类型 -> 中文说明
 NETWORK_ERROR_LABELS = {
     "timeout": "请求超时",
     "connect": "无法连接服务",
     "transport": "网络传输错误",
     "cancel": "运行已取消",
+    "config": "规则配置/安全错误",
 }
 
 
@@ -79,7 +81,10 @@ def render(value: Any, variables: dict) -> Any:
 
 
 def url_without_credentials(url: str) -> str:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "".join(ch if (ord(ch) >= 0x20 and ord(ch) != 0x7F) else "?" for ch in url)
     if parts.username or parts.password:
         netloc = parts.hostname or ""
         if parts.port:
@@ -296,20 +301,23 @@ def execute_check(
 
     base = base_url.rstrip("/")
 
-    def make_error_record(step: dict, kind: str, message: str, elapsed_ms: int = 0) -> dict:
+    def make_error_record(step: dict, kind: str, message: str, elapsed_ms: int = 0, *, rendered_path: Any = None) -> dict:
+        raw_path = str(rendered_path if rendered_path is not None else step.get("path", ""))
+        safe_path = mask_text(raw_path, secret_values)
+        raw_url = safe_path if "://" in safe_path else (base + safe_path)
         return {
             "name": step.get("name") or f"{step.get('method')} {step.get('path')}",
             "request": {
                 "method": step.get("method"),
-                "path": step.get("path"),
-                "url": url_without_credentials(base + str(step.get("path", ""))),
+                "path": safe_path,
+                "url": mask_text(url_without_credentials(raw_url), secret_values),
                 "headers": redact_headers(step.get("headers") or {}),
                 "json": redact_obj(step.get("json"), secret_values),
             },
             "response": None,
             "assertions": [],
             "extracted": {},
-            "error": {"kind": kind, "message": message, "label": NETWORK_ERROR_LABELS.get(kind, kind)},
+            "error": {"kind": kind, "message": mask_text(message, secret_values), "label": NETWORK_ERROR_LABELS.get(kind, kind)},
         }
 
     with httpx.Client(base_url=base, follow_redirects=False) as client:
@@ -338,6 +346,14 @@ def execute_check(
                 status = FAILED
                 reason = f"规则配置错误：变量 {{{{{e.name}}}}} 未定义（通常由前置步骤提取失败或拼写错误导致）"
                 step_records.append(make_error_record(step, "config", reason))
+                break
+
+            try:
+                path = validate_rendered_path(path)
+            except SafetyError as e:
+                status = FAILED
+                reason = f"规则配置/安全错误：步骤「{step_name}」{mask_text(str(e), secret_values)}"
+                step_records.append(make_error_record(step, "config", reason, rendered_path=path))
                 break
 
             timeout = float(step.get("timeout", default_timeout))

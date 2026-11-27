@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 
+from .safety import check_spec_url_safety
+
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
+MAX_SPEC_REDIRECTS = 5
 
 
 def extract_endpoints(spec: dict) -> list[dict]:
@@ -34,14 +37,29 @@ def extract_endpoints(spec: dict) -> list[dict]:
     return endpoints
 
 
-def fetch_spec(url: str, timeout: float = 10.0) -> dict:
-    resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+def fetch_spec(url: str, *, allow_remote: bool = False, timeout: float = 10.0) -> dict:
+    current_url = check_spec_url_safety(url, allow_remote=allow_remote)
+    with httpx.Client(follow_redirects=False, timeout=timeout) as client:
+        for hop in range(MAX_SPEC_REDIRECTS + 1):
+            resp = client.get(current_url)
+            if resp.is_redirect:
+                location = resp.headers.get("location")
+                if not location:
+                    break
+                if hop >= MAX_SPEC_REDIRECTS:
+                    raise ValueError(f"OpenAPI 地址重定向次数过多（超过 {MAX_SPEC_REDIRECTS} 次）")
+                next_url = urljoin(current_url, location.strip())
+                current_url = check_spec_url_safety(
+                    next_url, allow_remote=allow_remote, label="OpenAPI 重定向目标"
+                )
+                continue
+            break
+
     resp.raise_for_status()
-    content_type = (resp.headers.get("content-type") or "").lower()
-    if "json" in content_type or url.lower().endswith((".json",)):
-        return resp.json()
-    # 一些服务直接返回 JSON 但 content-type 不标准
     try:
-        return json.loads(resp.text)
+        data = json.loads(resp.text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"无法解析 OpenAPI 内容（既不是 JSON/yaml 内容的标准格式）: {e}") from e
+        raise ValueError(f"无法解析 OpenAPI 内容（仅支持标准 OpenAPI JSON 格式）: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("OpenAPI 内容必须是 JSON 对象")
+    return data

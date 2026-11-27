@@ -1,9 +1,15 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 import threading
 
 import httpx
 import pytest
 
 from verifier.executor import FAILED, PASSED, UNVERIFIABLE, evaluate_assertion, execute_check
+from verifier.models import validate_checks
 
 LOGIN = {
     "name": "登录",
@@ -233,3 +239,103 @@ def test_whole_placeholder_keeps_original_type(baseline_server):
     result = run(check, baseline_server)
     assert result["status"] == PASSED, result["reason"]
     assert result["steps"][1]["assertions"][0]["ok"] is True
+
+
+@contextmanager
+def _payload_server(payload: dict, hits: list[str]):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            hits.append(self.path)
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "step_path,extracted_value",
+    [
+        ("{{target}}", "https://example.com/evil"),
+        ("{{target}}", "//example.com/evil"),
+        ("/{{target}}", "/example.com/evil"),
+        ("/redirect?next={{target}}", "https://example.com/evil"),
+        ("{{target}}", "/api/orders\r\nX-Injected: 1"),
+        ("{{target}}", "/api/orders https://example.com"),
+        ("{{target}}", 12345),
+        ("{{target}}", ""),
+    ],
+)
+def test_rendered_step_path_blocks_base_url_escape_without_external_request(step_path, extracted_value):
+    hits: list[str] = []
+    check = {
+        "id": "path-escape-guard",
+        "name": "拦截动态渲染路径逃逸",
+        "category": "existing_behavior",
+        "steps": [
+            {
+                "name": "获取不可信的下一步地址",
+                "method": "GET",
+                "path": "/api/next",
+                "extract": {"target": {"source": "json", "path": "$.next", "sensitive": False}},
+                "assert": [{"type": "status", "op": "equals", "value": 200}],
+            },
+            {
+                "name": "跟随渲染后的路径",
+                "method": "GET",
+                "path": step_path,
+                "assert": [{"type": "status", "op": "equals", "value": 200}],
+            },
+        ],
+    }
+    assert validate_checks([check]) == []
+
+    with _payload_server({"next": extracted_value}, hits) as base_url:
+        result = run(check, base_url)
+
+    assert result["status"] == FAILED
+    assert hits == ["/api/next"], "第二步路径非法时必须在发送任何请求前中止"
+    second = result["steps"][1]
+    assert second["response"] is None
+    assert second["error"]["kind"] == "config"
+
+
+@pytest.mark.parametrize(
+    "bad_static_path",
+    [
+        "//example.com/evil",
+        "https://example.com/evil",
+        "/api/orders\r\nX-Injected: 1",
+        "/api/orders evil",
+        "/redirect?url=http://example.com/evil",
+    ],
+)
+def test_validate_checks_rejects_unsafe_static_step_paths(bad_static_path):
+    check = {
+        "id": "bad-path",
+        "name": "非法静态路径",
+        "category": "existing_behavior",
+        "steps": [
+            {
+                "method": "GET",
+                "path": bad_static_path,
+                "assert": [{"type": "status", "op": "equals", "value": 200}],
+            }
+        ],
+    }
+    errors = validate_checks([check])
+    assert errors, f"expected validation error for path={bad_static_path!r}"

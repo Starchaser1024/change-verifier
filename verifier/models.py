@@ -80,6 +80,8 @@ ASSERT_TYPES: dict[str, set[str]] = {
 _JSON_TYPES = {"string", "number", "integer", "boolean", "array", "object", "null"}
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
+_LEADING_VAR_RE = re.compile(r"^\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
 _EXTRACT_SOURCES = {"json", "header", "status", "text"}
 
 
@@ -131,8 +133,18 @@ def validate_check(check: Any, *, index: int = 0) -> list[str]:
         if not isinstance(method, str) or method.upper() not in HTTP_METHODS:
             _err(errors, f"{sp}: method 必须是 {HTTP_METHODS} 之一（当前: {method!r}）")
         path = step.get("path")
-        if not isinstance(path, str) or not path.startswith("/"):
+        if not isinstance(path, str) or not path:
             _err(errors, f"{sp}: path 必须以 / 开头（当前: {path!r}）")
+        else:
+            if not (path.startswith("/") or _LEADING_VAR_RE.match(path)):
+                _err(errors, f"{sp}: path 必须以 / 开头（当前: {path!r}）")
+            if path.startswith(("//", "/\\")):
+                _err(errors, f"{sp}: path 不能以 // 或 /\\ 开头（当前: {path!r}）")
+            stripped_path = _TEMPLATE_VAR_RE.sub("x", path)
+            if "://" in stripped_path:
+                _err(errors, f"{sp}: path 不能包含协议前缀 ://（当前: {path!r}）")
+            if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped_path):
+                _err(errors, f"{sp}: path 不能包含空白或控制字符（当前: {path!r}）")
         headers = step.get("headers")
         if headers is not None:
             if not isinstance(headers, dict) or not all(
