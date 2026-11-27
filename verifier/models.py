@@ -16,8 +16,10 @@
           "name": "登录获取 token",
           "method": "POST",
           "path": "/api/login",
+          "params": {"tenant": "default"},        # 可选，URL 查询参数
           "headers": {},                          # 可选
-          "json": {"username": "alice", "password": "alice-password"},   # 可选
+          "json": {"username": "alice", "password": "alice-password"},   # 可选（与 form 二选一）
+          "form": null,                           # 可选，application/x-www-form-urlencoded 表单字段（如 OAuth2 /token）
           "timeout": 5,                           # 可选，秒
           "extract": {                            # 可选，从响应中提取变量供后续步骤使用
             "token": {"source": "json", "path": "$.access_token", "sensitive": true}
@@ -89,6 +91,21 @@ def _err(errors: list[str], msg: str) -> None:
     errors.append(msg)
 
 
+def _is_kv_scalar_or_list(value: Any) -> bool:
+    scalar = (str, int, float, bool)
+    if isinstance(value, scalar):
+        return True
+    if isinstance(value, list):
+        return all(isinstance(item, scalar) for item in value)
+    return False
+
+
+def _is_valid_kv_mapping(mapping: Any) -> bool:
+    if not isinstance(mapping, dict):
+        return False
+    return all(isinstance(k, str) and bool(k.strip()) and _is_kv_scalar_or_list(v) for k, v in mapping.items())
+
+
 def validate_check(check: Any, *, index: int = 0) -> list[str]:
     """校验单条检查，返回错误信息列表（为空表示合法）。"""
     errors: list[str] = []
@@ -151,6 +168,14 @@ def validate_check(check: Any, *, index: int = 0) -> list[str]:
                 isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
             ):
                 _err(errors, f"{sp}: headers 必须是「字符串 -> 字符串」的 JSON 对象")
+        params = step.get("params")
+        if params is not None and not _is_valid_kv_mapping(params):
+            _err(errors, f"{sp}: params 必须是查询参数对象（键为非空字符串，值为字符串/数字/布尔或它们的数组）")
+        form = step.get("form")
+        if form is not None and not _is_valid_kv_mapping(form):
+            _err(errors, f"{sp}: form 必须是表单字段对象（键为非空字符串，值为字符串/数字/布尔或它们的数组）")
+        if step.get("json") is not None and form is not None:
+            _err(errors, f"{sp}: json 与 form 不能同时在同一请求步骤中使用")
         timeout = step.get("timeout")
         if timeout is not None and (not isinstance(timeout, (int, float)) or not (0.1 <= float(timeout) <= 60)):
             _err(errors, f"{sp}: timeout 必须在 0.1~60 秒之间")

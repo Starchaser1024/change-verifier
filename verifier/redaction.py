@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Iterable
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
 REDACTED = "[REDACTED]"
 
@@ -71,3 +72,38 @@ def redact_obj(obj: Any, secret_values: Iterable[str] = (), _depth: int = 0) -> 
     if isinstance(obj, str):
         return mask_text(obj, secret_values)
     return obj
+
+
+def redact_url(url: str, secret_values: Iterable[str] = ()) -> str:
+    """移除 URL 凭据并对路径与查询字符串中的敏感键名及动态机密值脱敏。"""
+    if not isinstance(url, str):
+        return url
+    secrets_list = [str(s) for s in secret_values if s]
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        cleaned = "".join(ch if (ord(ch) >= 0x20 and ord(ch) != 0x7F) else "?" for ch in url)
+        return mask_text(cleaned, secrets_list)
+
+    netloc = parts.netloc
+    if parts.username or parts.password:
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc += f":{parts.port}"
+
+    safe_path = mask_text(parts.path, secrets_list)
+    safe_query = parts.query
+    if parts.query:
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        encoded_pairs: list[str] = []
+        for k, v in pairs:
+            safe_k = quote(mask_text(k, secrets_list), safe="[]")
+            if is_sensitive_name(k):
+                safe_v = REDACTED
+            else:
+                safe_v = quote(mask_text(v, secrets_list), safe="[]")
+            encoded_pairs.append(f"{safe_k}={safe_v}")
+        safe_query = "&".join(encoded_pairs)
+
+    safe_fragment = mask_text(parts.fragment, secrets_list) if parts.fragment else ""
+    return urlunsplit((parts.scheme, netloc, safe_path, safe_query, safe_fragment))

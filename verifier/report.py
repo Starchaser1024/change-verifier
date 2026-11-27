@@ -33,12 +33,20 @@ def _render_step_md(step: dict) -> str:
     method = req.get("method", "?")
     path = req.get("path", "?")
     lines.append(f"  - 请求：`{method} {path}`")
+    if req.get("params"):
+        lines.append(f"    - 查询参数：`{json.dumps(req['params'], ensure_ascii=False)}`")
     if req.get("headers"):
         lines.append(f"    - 请求头：`{json.dumps(req['headers'], ensure_ascii=False)}`")
     if req.get("json") is not None:
         lines.append("    - 请求体：")
         lines.append("      ```json")
         for ln in _fmt(req["json"]).splitlines():
+            lines.append(f"      {ln}")
+        lines.append("      ```")
+    if req.get("form") is not None:
+        lines.append("    - 表单请求体（`application/x-www-form-urlencoded`）：")
+        lines.append("      ```json")
+        for ln in _fmt(req["form"]).splitlines():
             lines.append(f"      {ln}")
         lines.append("      ```")
     extracted = step.get("extracted") or {}

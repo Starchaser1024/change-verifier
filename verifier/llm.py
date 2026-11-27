@@ -41,7 +41,8 @@ SYSTEM_PROMPT = (
 1. 只能依据用户明确给出的需求与接口清单提出建议，不要臆造接口或业务规则。
 2. 每条检查必须包含字段：id(小写字母/数字/.-_, 不超过64位)、name、category(existing_behavior 或 new_requirement)、
    expectation、steps。existing_behavior 表示「修改前应已正常的原有行为」，new_requirement 表示「修改后需要满足的新行为」。
-3. steps 中每个步骤包含：name、method、path(以/开头)、headers(可选, 值可以是 {{变量}})、json(可选)、timeout(可选, 秒)、
+3. steps 中每个步骤包含：name、method、path(以/开头)、params(可选, 查询参数对象)、headers(可选, 值可以是 {{变量}})、
+   json(可选) 或 form(可选, application/x-www-form-urlencoded 表单对象，如 OAuth2 /token 登录，与 json 二选一)、timeout(可选, 秒)、
    extract(可选, {变量名: {source: json|header|status|text, path: 提取路径, sensitive: true/false}})、
    assert(非空数组；元素形如 {"type": "status", "op": "equals", "value": 200} 或
    {"type": "json", "path": "$.items", "op": "exists"})。

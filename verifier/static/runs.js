@@ -142,10 +142,14 @@ function renderEnv(env, label) {
   let html = `<div class="env ${cls}"><h4>${label}：${STATUS_LABELS[env.status]}</h4><div class="muted">${esc(env.reason)}</div>`;
   for (const step of env.steps || []) {
     html += `<div class="step-block"><div class="req-line">${esc(step.request.method)} ${esc(step.request.path)}</div>`;
+    if (step.request.params && Object.keys(step.request.params).length)
+      html += `<div class="muted">查询参数：${esc(JSON.stringify(step.request.params))}</div>`;
     if (step.request.headers && Object.keys(step.request.headers).length)
       html += `<div class="muted">请求头：${esc(JSON.stringify(step.request.headers))}</div>`;
     if (step.request.json !== undefined && step.request.json !== null)
       html += `<pre>${esc(JSON.stringify(step.request.json))}</pre>`;
+    if (step.request.form !== undefined && step.request.form !== null)
+      html += `<div class="muted">表单请求体：</div><pre>${esc(JSON.stringify(step.request.form))}</pre>`;
     if (step.error) html += `<div class="err-line">⚠ ${esc(step.error.label || step.error.kind)}：${esc(step.error.message)}</div>`;
     if (step.response) {
       html += `<div>响应：<b>${step.response.status}</b>（${step.response.elapsed_ms} ms）</div>`;

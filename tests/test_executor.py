@@ -4,12 +4,17 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import threading
+from urllib.parse import parse_qs
 
+from fastapi import FastAPI, HTTPException, Request
 import httpx
 import pytest
 
+from tests.conftest import free_port, start_server, wait_ready
+from verifier.classification import build_summary, compare_check
 from verifier.executor import FAILED, PASSED, UNVERIFIABLE, evaluate_assertion, execute_check
 from verifier.models import validate_checks
+from verifier.report import build_json_report, render_markdown
 
 LOGIN = {
     "name": "登录",
@@ -339,3 +344,163 @@ def test_validate_checks_rejects_unsafe_static_step_paths(bad_static_path):
     }
     errors = validate_checks([check])
     assert errors, f"expected validation error for path={bad_static_path!r}"
+
+
+@contextmanager
+def _oauth2_and_pagination_fastapi_server():
+    app = FastAPI()
+    issued_token = "oauth2-tok+live/42=ok"
+    all_items = [{"id": i, "title": f"item-{i}"} for i in range(1, 7)]
+
+    @app.get("/healthz")
+    def healthz():
+        return {"ok": True}
+
+    @app.post("/token")
+    async def login_token(request: Request):
+        ctype = (request.headers.get("content-type") or "").lower()
+        if "application/x-www-form-urlencoded" not in ctype:
+            raise HTTPException(status_code=415, detail="OAuth2 /token requires form-urlencoded body")
+        form = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        username = (form.get("username") or [""])[0]
+        password = (form.get("password") or [""])[0]
+        grant_type = (form.get("grant_type") or ["password"])[0]
+        if grant_type != "password" or username != "alice" or password != "alice-form-secret":
+            raise HTTPException(status_code=401, detail="invalid credentials")
+        return {
+            "access_token": issued_token,
+            "token_type": "bearer",
+            "next_page": 2,
+        }
+
+    @app.get("/items")
+    def list_items(
+        request: Request,
+        page: int = 1,
+        page_size: int = 2,
+        api_key: str = "",
+        cursor: str = "",
+    ):
+        auth = request.headers.get("Authorization")
+        if auth != f"Bearer {issued_token}" or api_key != "query-key-777" or cursor != issued_token:
+            raise HTTPException(status_code=403, detail="forbidden")
+        start = (page - 1) * page_size
+        return {
+            "items": all_items[start : start + page_size],
+            "page": page,
+            "page_size": page_size,
+            "total": len(all_items),
+        }
+
+    port = free_port()
+    server, thread = start_server(app, port)
+    base = f"http://127.0.0.1:{port}"
+    wait_ready(base)
+    try:
+        yield base
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+def test_oauth2_form_login_and_query_params_pagination_with_full_redaction():
+    check = {
+        "id": "oauth2-form-and-params",
+        "name": "OAuth2 表单登录与分页查询脱敏",
+        "category": "new_requirement",
+        "expectation": "通过 form 登录 /token 后携带 params 分页拉取第 2 页且全链路凭据脱敏",
+        "steps": [
+            {
+                "name": "OAuth2 表单登录",
+                "method": "POST",
+                "path": "/token",
+                "form": {
+                    "grant_type": "password",
+                    "username": "alice",
+                    "password": "alice-form-secret",
+                    "client_secret": "cs-live-999",
+                },
+                "extract": {
+                    "token": {"source": "json", "path": "$.access_token", "sensitive": True},
+                    "target_page": {"source": "json", "path": "$.next_page", "sensitive": False},
+                },
+                "assert": [
+                    {"type": "status", "op": "equals", "value": 200},
+                    {"type": "json", "path": "$.token_type", "op": "equals", "value": "bearer"},
+                ],
+            },
+            {
+                "name": "带 params 查询第 2 页",
+                "method": "GET",
+                "path": "/items",
+                "params": {
+                    "page": "{{target_page}}",
+                    "page_size": 2,
+                    "api_key": "query-key-777",
+                    "cursor": "{{token}}",
+                },
+                "headers": {"Authorization": "Bearer {{token}}"},
+                "assert": [
+                    {"type": "status", "op": "equals", "value": 200},
+                    {"type": "json", "path": "$.page", "op": "equals", "value": 2},
+                    {"type": "json", "path": "$.items", "op": "length_equals", "value": 2},
+                    {"type": "json", "path": "$.items[0].id", "op": "equals", "value": 3},
+                ],
+            },
+        ],
+    }
+    assert validate_checks([check]) == []
+
+    with _oauth2_and_pagination_fastapi_server() as base_url:
+        res = run(check, base_url)
+
+    assert res["status"] == PASSED, res["reason"]
+    step1, step2 = res["steps"]
+    assert step1["request"]["form"] == {
+        "grant_type": "password",
+        "username": "alice",
+        "password": "[REDACTED]",
+        "client_secret": "[REDACTED]",
+    }
+    assert step1["request"]["json"] is None
+    assert step2["request"]["params"] == {
+        "page": 2,
+        "page_size": 2,
+        "api_key": "[REDACTED]",
+        "cursor": "[REDACTED]",
+    }
+    assert "api_key=[REDACTED]" in step2["request"]["url"]
+    assert "cursor=[REDACTED]" in step2["request"]["url"]
+
+    cmp = compare_check(check, res, res, {check["id"]: (res, res)})
+    payload = {"summary": build_summary([cmp], total_checks=1, run_status="completed"), "checks": [cmp]}
+    task = {"id": 1, "name": "OAuth2 验收", "requirement": "", "baseline_url": "http://127.0.0.1:1", "candidate_url": "http://127.0.0.1:2"}
+    ver = {"id": 1, "version": 1, "status": "confirmed", "note": "", "confirmed_at": "2026-01-01T00:00:00Z"}
+    run_meta = {"id": 1, "status": "completed", "started_at": "2026-01-01T00:00:00Z", "finished_at": "2026-01-01T00:00:01Z", "error": None}
+    md = render_markdown(task, ver, run_meta, payload)
+    json_rep = json.dumps(build_json_report(task, ver, run_meta, payload), ensure_ascii=False)
+
+    assert "表单请求体" in md
+    assert "查询参数" in md
+    for secret in ("alice-form-secret", "cs-live-999", "query-key-777", "oauth2-tok+live/42=ok", "oauth2-tok"):
+        assert secret not in md
+        assert secret not in json_rep
+
+
+def test_executor_rejects_simultaneous_json_and_form_even_without_validator(baseline_server):
+    check = {
+        "id": "conflict-body",
+        "name": "同时传 json 与 form",
+        "steps": [
+            {
+                "method": "POST",
+                "path": "/api/login",
+                "json": {"username": "alice"},
+                "form": {"username": "alice"},
+                "assert": [{"type": "status", "op": "equals", "value": 200}],
+            }
+        ],
+    }
+    res = run(check, baseline_server)
+    assert res["status"] == FAILED
+    assert res["steps"][0]["error"]["kind"] == "config"

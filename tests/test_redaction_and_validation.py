@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import pytest
 
 from verifier.models import validate_checks
-from verifier.redaction import REDACTED, mask_text, redact_headers, redact_obj
+from verifier.redaction import REDACTED, mask_text, redact_headers, redact_obj, redact_url
 
 
 def test_redact_headers():
@@ -122,3 +124,68 @@ def test_validate_rejects_non_integer_length_value(bad_value):
     ]
     text = "\n".join(validate_checks([c]))
     assert "必须是整数" in text
+
+
+def test_redact_url_masks_credentials_sensitive_query_keys_and_encoded_secrets():
+    raw = (
+        "http://alice:super-pass@127.0.0.1:8620/api/orders"
+        "?page=2&api_key=sk-query-123&cursor=tok%2Babc%2F1%3D2"
+    )
+    masked = redact_url(raw, ["tok+abc/1=2"])
+    assert "alice" not in masked
+    assert "super-pass" not in masked
+    assert "sk-query-123" not in masked
+    assert "tok" not in masked
+    assert "page=2" in masked
+    assert f"api_key={REDACTED}" in masked
+    assert f"cursor={REDACTED}" in masked
+
+
+def test_validate_accepts_params_and_oauth2_form_steps():
+    c = {
+        "id": "oauth2-and-params",
+        "name": "OAuth2 表单登录与分页参数",
+        "category": "existing_behavior",
+        "steps": [
+            {
+                "name": "OAuth2 登录",
+                "method": "POST",
+                "path": "/token",
+                "form": {
+                    "grant_type": "password",
+                    "username": "alice",
+                    "password": "alice-password",
+                    "scope": ["orders:read", "orders:write"],
+                },
+                "extract": {"token": {"source": "json", "path": "$.access_token", "sensitive": True}},
+                "assert": [{"type": "status", "op": "equals", "value": 200}],
+            },
+            {
+                "name": "分页查询",
+                "method": "GET",
+                "path": "/api/orders",
+                "params": {"page": 1, "page_size": 5, "active": True, "tag": ["vip", "paid"]},
+                "headers": {"Authorization": "Bearer {{token}}"},
+                "assert": [{"type": "status", "op": "equals", "value": 200}],
+            },
+        ],
+    }
+    assert validate_checks([c]) == []
+
+
+def test_validate_rejects_json_plus_form_and_invalid_params_or_form_types():
+    both = valid_check()
+    both["steps"][0]["method"] = "POST"
+    both["steps"][0]["json"] = {"username": "alice"}
+    both["steps"][0]["form"] = {"username": "alice"}
+    err_both = "\n".join(validate_checks([both]))
+    assert "json 与 form 不能同时" in err_both
+
+    bad_params = valid_check()
+    bad_params["steps"][0]["params"] = {"filter": {"nested": 1}}
+    assert any("params" in e for e in validate_checks([bad_params]))
+
+    bad_form = valid_check()
+    bad_form["steps"][0]["method"] = "POST"
+    bad_form["steps"][0]["form"] = {"": "empty-key"}
+    assert any("form" in e for e in validate_checks([bad_form]))

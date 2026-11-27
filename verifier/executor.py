@@ -1,10 +1,10 @@
 """HTTP 检查执行器：在单个环境上按顺序执行一条检查的所有步骤。
 
-- 支持请求方法、路径、请求头、JSON 请求体、超时。
+- 支持请求方法、路径、查询参数（params）、请求头、JSON 请求体或表单请求体（form）、超时。
 - 支持从响应中提取变量（json / header / status / text-regex）供后续步骤引用。
 - 状态码、响应头、JSON 字段、文本断言。
 - 网络层错误（超时、连接失败、传输错误）归类为「无法判断」，绝不当作业务失败。
-- 所有记录在写入前脱敏（Authorization/Cookie/密码/token）。
+- 所有记录在写入前脱敏（Authorization/Cookie/密码/token/敏感查询参数与表单字段）。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .jsonpath import MISSING, get_path
-from .redaction import REDACTED, is_sensitive_name, mask_text, redact_headers, redact_obj
+from .redaction import REDACTED, is_sensitive_name, mask_text, redact_headers, redact_obj, redact_url
 from .safety import SafetyError, validate_rendered_path
 
 DEFAULT_TIMEOUT_S = 5.0
@@ -301,18 +301,35 @@ def execute_check(
 
     base = base_url.rstrip("/")
 
-    def make_error_record(step: dict, kind: str, message: str, elapsed_ms: int = 0, *, rendered_path: Any = None) -> dict:
+    def make_error_record(
+        step: dict,
+        kind: str,
+        message: str,
+        elapsed_ms: int = 0,
+        *,
+        rendered_path: Any = None,
+        rendered_params: Any = None,
+        rendered_form: Any = None,
+    ) -> dict:
         raw_path = str(rendered_path if rendered_path is not None else step.get("path", ""))
-        safe_path = mask_text(raw_path, secret_values)
+        safe_path = redact_url(mask_text(raw_path, secret_values), secret_values)
         raw_url = safe_path if "://" in safe_path else (base + safe_path)
         return {
             "name": step.get("name") or f"{step.get('method')} {step.get('path')}",
             "request": {
                 "method": step.get("method"),
                 "path": safe_path,
-                "url": mask_text(url_without_credentials(raw_url), secret_values),
+                "url": redact_url(url_without_credentials(raw_url), secret_values),
+                "params": redact_obj(
+                    rendered_params if rendered_params is not None else step.get("params"),
+                    secret_values,
+                ),
                 "headers": redact_headers(step.get("headers") or {}),
                 "json": redact_obj(step.get("json"), secret_values),
+                "form": redact_obj(
+                    rendered_form if rendered_form is not None else step.get("form"),
+                    secret_values,
+                ),
             },
             "response": None,
             "assertions": [],
@@ -333,8 +350,10 @@ def execute_check(
             try:
                 method = str(step["method"]).upper()
                 path = render(step["path"], variables)
+                params = render(step["params"], variables) if step.get("params") is not None else None
                 headers = render(step.get("headers") or {}, variables)
-                body = render(step.get("json"), variables) if "json" in step else None
+                body = render(step.get("json"), variables) if step.get("json") is not None else None
+                form_body = render(step["form"], variables) if step.get("form") is not None else None
                 # 断言里的 value 同样支持 {{变量}}（整个占位符时保持原始类型，如数字 id）
                 rendered_asserts = []
                 for a in step.get("assert", []):
@@ -353,30 +372,92 @@ def execute_check(
             except SafetyError as e:
                 status = FAILED
                 reason = f"规则配置/安全错误：步骤「{step_name}」{mask_text(str(e), secret_values)}"
-                step_records.append(make_error_record(step, "config", reason, rendered_path=path))
+                step_records.append(
+                    make_error_record(
+                        step,
+                        "config",
+                        reason,
+                        rendered_path=path,
+                        rendered_params=params,
+                        rendered_form=form_body,
+                    )
+                )
+                break
+
+            if body is not None and form_body is not None:
+                status = FAILED
+                reason = f"规则配置错误：步骤「{step_name}」不能同时指定 json 与 form 请求体"
+                step_records.append(
+                    make_error_record(
+                        step,
+                        "config",
+                        reason,
+                        rendered_path=path,
+                        rendered_params=params,
+                        rendered_form=form_body,
+                    )
+                )
                 break
 
             timeout = float(step.get("timeout", default_timeout))
             started = time.perf_counter()
             try:
-                resp = client.request(method, path, headers=headers or None, json=body, timeout=timeout)
+                resp = client.request(
+                    method,
+                    path,
+                    params=params,
+                    headers=headers or None,
+                    json=body,
+                    data=form_body,
+                    timeout=timeout,
+                )
             except httpx.TimeoutException:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 status = UNVERIFIABLE
                 reason = f"步骤「{step_name}」请求超时（{timeout}s），属于环境/执行问题，无法判断业务结果"
-                step_records.append(make_error_record(step, "timeout", f"请求 {method} {path} 超时（{timeout}s）", elapsed_ms))
+                step_records.append(
+                    make_error_record(
+                        step,
+                        "timeout",
+                        f"请求 {method} {path} 超时（{timeout}s）",
+                        elapsed_ms,
+                        rendered_path=path,
+                        rendered_params=params,
+                        rendered_form=form_body,
+                    )
+                )
                 break
             except httpx.ConnectError as e:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 status = UNVERIFIABLE
                 reason = f"步骤「{step_name}」无法连接 {base}，服务不可达，无法判断业务结果"
-                step_records.append(make_error_record(step, "connect", f"连接失败: {e}", elapsed_ms))
+                step_records.append(
+                    make_error_record(
+                        step,
+                        "connect",
+                        f"连接失败: {e}",
+                        elapsed_ms,
+                        rendered_path=path,
+                        rendered_params=params,
+                        rendered_form=form_body,
+                    )
+                )
                 break
             except httpx.HTTPError as e:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 status = UNVERIFIABLE
                 reason = f"步骤「{step_name}」网络/协议错误：{e}"
-                step_records.append(make_error_record(step, "transport", str(e), elapsed_ms))
+                step_records.append(
+                    make_error_record(
+                        step,
+                        "transport",
+                        str(e),
+                        elapsed_ms,
+                        rendered_path=path,
+                        rendered_params=params,
+                        rendered_form=form_body,
+                    )
+                )
                 break
             elapsed_ms = int((time.perf_counter() - started) * 1000)
 
@@ -385,10 +466,12 @@ def execute_check(
                 "name": step_name,
                 "request": {
                     "method": method,
-                    "path": path,
-                    "url": url_without_credentials(str(resp.request.url)),
+                    "path": redact_url(path, secret_values),
+                    "url": redact_url(str(resp.request.url), secret_values),
+                    "params": redact_obj(params, secret_values),
                     "headers": redact_headers(headers or {}),
                     "json": redact_obj(body, secret_values),
+                    "form": redact_obj(form_body, secret_values),
                 },
                 "response": evidence,
                 "assertions": [],
